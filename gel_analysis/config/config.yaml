@@ -1,0 +1,73 @@
+paths:
+  # Where to store resulting dataframes
+  output_dir: "/pgen_int_work/BRS/dd/sam/projects/gel-dating-paper/output_data/"
+
+  # Other input data
+  data_dir: "/pgen_int_work/BRS/dd/sam/projects/gel-dating-paper/data/"
+
+  plots_dir: "/pgen_int_work/BRS/dd/sam/gitrepo/gel-dating-paper/figures/"
+
+  # Trees
+  ts_dir: "/re_gecip/shared_allGeCIPs/drobertson/trees/gel-dating-paper/data/dated_with_singletons_july25/"
+
+  # gnomAD population assignments
+  pops_path: "{data_dir}all-gnomad-pop-assignments.tsv"
+
+  # Ancestral FASTA
+  fasta_ancestor: "/public_data_resources/homo_sapiens_ancestor_hg38/homo_sapiens_ancestor_{chrom_no_prefix}.fa"
+
+  # aggV2 chunks file
+  aggV2_chunks: "{data_dir}aggV2-chunks.txt"
+
+  # Zarr (per chromosome)
+  zarr_path: "/re_gecip/shared_allGeCIPs/bjeffery/zarrs/phased_panel_{chrom}.vcf.gz.zarr"
+
+  # Zarr indexes (per chromosome)
+  zarr_ind_index: "{data_dir}zarr_indexes/{chrom}-phased-individual_index.csv"
+  zarr_pos_index: "{data_dir}zarr_indexes/{chrom}-phased-position_index.csv"
+
+  # LabKey .netrc file
+  netrc_file: "/home/stallman/.netrc"
+
+  # Singletons directory
+  singletons_dir: "/re_scratch/dd/sam/data/singletons/wfilters_long/"
+
+  # Singletons (per chromosome)
+  singletons_tsv: "{singletons_dir}{chrom}_singletons_wfilters.tsv.gz"
+
+  # AFs
+  gnomad_exomes_tsv: "{data_dir}gnomad/gnomadv4-exomes-{chrom}-afs.tsv.gz"
+  gnomad_genomes_tsv: "{data_dir}gnomad/gnomadv4-genomes-{chrom}-afs.tsv.gz"
+  ga100k_tsv: "{data_dir}genome_asia100k/genome-asia-100k-genomes-hg38-{chrom}-afs.tsv.gz"
+
+  # Missense effects
+  am_tsv: "{data_dir}am_scores/am_scores-{chrom}.tsv.gz"
+  pai_tsv: "{data_dir}pai_scores/pai3d_scores-{chrom}.tsv.gz"
+
+  # Archaic genotypes
+  denisovan_tsv: "{data_dir}archaics/{chrom}-denisovan_altai-hg38.tsv.gz"
+  altai_neanderthal_tsv: "{data_dir}archaics/{chrom}-neanderthal_altai-hg38.tsv.gz"
+  vindija_neanderthal_tsv: "{data_dir}archaics/{chrom}-neanderthal_vindija-hg38.tsv.gz"
+  chagyrskaya_neanderthal_tsv: "{data_dir}archaics/{chrom}-neanderthal_chagyrskaya-hg38.tsv.gz"
+  
+  # Constraint metrics
+  gnomad_constraint_txt: "{data_dir}gnomad/gnomad-genomes-1kb_constraint-raw.txt.gz"
+
+  # ENSEMBL gene transcripts
+  genes_ensembl: "{data_dir}genes/ensembl-genes.gtf.gz"
+
+  # PanelApp gene panels from 11/11/24
+  panel_app_tsv: "{data_dir}panel_app/all-panel_app-11.11.24.tsv"
+
+  # ClinVar pathogenicity classes from 04/24
+  clinvar_tsv: "{data_dir}clinvar/clinvar-germline-snps-hg38-2024-04.tsv.gz"
+
+  cytoband: "/public_data_resources/centromeres_and_telomeres_hg38/cytoband.txt.gz"
+  gaps: "{data_dir}gaps/gap.txt.gz"
+
+  # Relate region data
+  # relate_ages_csv: "data/relate_YRI.csv.zst"
+  relate_means_csv: "data/relate_means.csv"
+
+  # aggV2 Kinship matrix
+  aggV2_kinship_matrix: "/gel_data_resources/main_programme/aggregation/aggregate_gVCF_strelka/aggV2/additional_data/PCs_relatedness/relatedness/GEL_aggV2_MAF5_mp10_0.0442.kin0"

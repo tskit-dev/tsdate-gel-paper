@@ -1,0 +1,758 @@
+---
+title: "GEL - Allele age and negative selection"
+author: Sam Tallman
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+    toc_collapsed: true
+    toc_depth: 4
+    number_sections: true
+    code_folding: hide
+params:
+    ts_tsv: "trees_singletons_july25.tsv"
+---
+
+# Packages
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+```{r, message = FALSE}
+library(tidyverse)
+library(data.table)
+library(viridis)
+library(cowplot)
+library(ggpubr)
+library(reticulate)
+library(magrittr)
+library(MASS)
+library(broom)
+library(lme4)
+library(glue)
+library(polars)
+library(tidypolars)
+library(rlang)
+library(grid)
+
+## virtual env in container
+use_virtualenv("/opt/python_env", required = TRUE)
+```
+
+# Parameters
+
+```{r, message = FALSE}
+## Python functions for reticulate
+source_python("functions/gel-funcs.py")
+
+## Source R functions
+source("functions/gel-funcs.R")
+source("functions/gel-plotting_funcs.R")
+set.seed(31)
+```
+
+File paths from config...
+
+```{r}
+config <- yaml::read_yaml("config/config.yaml")
+
+# Fill templates
+paths <- lapply(config$paths, function(path) {
+  if (grepl("\\{chrom\\}|\\{chrom_no_prefix\\}", path)) {
+    return(NULL)   # skip chrom-templated paths
+  }
+  glue(path,
+       data_dir       = config$paths$data_dir,
+       singletons_dir = config$paths$singletons_dir
+  )
+})
+
+paths <- Filter(Negate(is.null), paths)
+```
+
+Paths and information from the dated trees
+
+```{r}
+## List of trees (with singletons included)
+ts_tsv <- params$ts_tsv
+trees_list <- read_tsv(ts_tsv)
+ts_dir <- paths$ts_dir
+```
+
+# Data
+
+We read in the relevant data from chromosomes
+- Generated using gel_ts-df.Rmd
+
+```{r, message = FALSE}
+# Extract relevant columns from the ts_df for all chromosomes
+selected_columns <- c(
+    "chromosome",
+    "position",
+    "ts_name",
+    "AC_ts",
+    "AF_ts",
+    "shape_time",
+    "scale_time",
+    "mean_time",
+    "singleton_sample_id",
+    "panel_app_moi",
+    "AM_score",
+    "mutation_root_parent",
+    "PAI3D_score",
+    "gnocchi_z"
+  )
+```
+
+Lazy loading for filtering etc.
+We exclude:
+- Mutations below the unconstrained root
+- Mutations without any dates in the tree sequences
+See outputs of gel-summary_stats.Rmd for numbers of these specific mutations
+```{r}
+ts_lf_merge <- scan_parquet_polars(file.path(paths$output_dir, "all-chr*-df.parquet")) |>
+  dplyr::select(all_of(selected_columns)) |>
+  compute() %>%
+  filter(
+    mutation_root_parent == FALSE & !is.na(mean_time)
+  )
+```
+
+# Additional stats
+Add in AlphaMissense categories
+```{r}
+## Case when R-side issue..
+ts_lf_merge <- ts_lf_merge$with_columns(list(
+  pl$when(pl$col("AM_score")$is_null())$
+    then(pl$lit(NA_character_)$cast(pl$Utf8))$
+    when(pl$col("AM_score") < 0.34)$
+    then(pl$lit("Likely benign"))$
+    when(pl$col("AM_score") < 0.564)$
+    then(pl$lit("Ambiguous"))$
+    otherwise(pl$lit("Likely pathogenic"))$
+    alias("AM_pred")
+))
+```
+
+Add in PrimateAI-3D categories
+```{r}
+ts_lf_merge <- ts_lf_merge$with_columns(list(
+  pl$when(pl$col("PAI3D_score")$is_null())$
+    then(pl$lit(NA_character_)$cast(pl$Utf8))$
+    when(pl$col("PAI3D_score") > 0.80)$
+    then(pl$lit("Likely pathogenic"))$
+    when(pl$col("PAI3D_score") < 0.60)$
+    then(pl$lit("Likely benign"))$
+    otherwise(pl$lit("Ambiguous"))$
+    alias("PAI3D_pred")
+))
+```
+
+Z-scoring ages
+```{r}
+ts_lf_merge %<>%
+z_normalise(
+      group_col = "AC_ts",
+      score_col = "mean_time",
+      z_col = "time_z",
+      log10 = TRUE
+    )
+```
+
+Missense restricted (smaller) tibble
+```{r}
+ts_df_missense <- ts_lf_merge %>%
+  drop_na(AM_score) %>%
+  as_tibble()
+```
+
+## Summarise numbers across classes
+- AlphaMissense categories (singletons + ur)
+- PrimateAI-3D categories (singletons + ur)
+- PanelApp mode of inheritance categories (singletons + ur)
+
+```{r, message= FALSE}
+summarise_block <- function(df, group_var) {
+  df %>%
+    group_by({{ group_var }}) %>%
+    summarise(
+      under_100   = mean(mean_time < 100, na.rm = TRUE),
+      n           = n(),
+      g_mean_time = exp(mean(log(mean_time), na.rm = TRUE)),
+      .groups = "drop"
+    ) %>%
+    mutate(prop = n / sum(n),
+           grouping = as_string(ensym(group_var))) %>%
+    rename(level = {{ group_var }})
+}
+
+# subsets
+ultra_rare <- ts_df_missense %>% filter(AF_ts < 0.001)
+singletons <- ts_df_missense %>% filter(AC_ts == 1)
+
+# Ultra-rare blocks (mirror original behavior: keep MOI as-is; drop NA for AM/PAI)
+ur_panel <- ultra_rare %>%
+  summarise_block(panel_app_moi) %>%
+  mutate(subset = "Ultra-rare (AF_ts < 0.001)")
+
+ur_am <- ultra_rare %>%
+  drop_na(AM_pred) %>%
+  summarise_block(AM_pred) %>%
+  mutate(subset = "Ultra-rare (AF_ts < 0.001)")
+
+ur_pai <- ultra_rare %>%
+  drop_na(PAI3D_pred) %>%
+  summarise_block(PAI3D_pred) %>%
+  mutate(subset = "Ultra-rare (AF_ts < 0.001)")
+
+# Singleton blocks (mirror original behavior)
+sg_panel <- singletons %>%
+  summarise_block(panel_app_moi) %>%
+  mutate(subset = "Singletons (AC_ts == 1)")
+
+sg_am <- singletons %>%
+  drop_na(AM_pred) %>%
+  summarise_block(AM_pred) %>%
+  mutate(subset = "Singletons (AC_ts == 1)")
+
+sg_pai <- singletons %>%
+  drop_na(PAI3D_pred) %>%
+  summarise_block(PAI3D_pred) %>%
+  mutate(subset = "Singletons (AC_ts == 1)")
+
+# final table, same columns/statistics as before
+stats_tbl <- bind_rows(
+  ur_panel, ur_am, ur_pai,
+  sg_panel, sg_am, sg_pai
+) %>%
+  dplyr::select(subset, grouping, level, under_100, n, g_mean_time, prop) %>%
+  arrange(subset, grouping, desc(n)) %>%
+  mutate(
+    grouping = case_when(
+      grouping == "AM_pred" ~ "AlphaMissense",
+      grouping == "PAI3D_pred" ~ "PrimateAI-3D",
+      grouping == "panel_app_moi" ~ "PanelApp gene mode of inheritance"
+    )
+  )
+
+knitr::kable(stats_tbl)
+```
+We'll later exclude those small number of mutations with BOTH monoallelic (domiant) & biallelic (recessive) inheritance
+and those with NA (probably a bug)
+
+## Singleton missense plots across classes
+- Log scaled ages by classes (box+whiskers)
+- Also Duncan's sampling QQ plots
+
+### AlphaMissense
+Box and whiskers plot
+```{r}
+am_sing_quantiles <- make_age_cat_boxplot(
+  ts_df_missense %>%
+    filter(AC_ts == 1),
+  cat_col   = AM_pred,
+  categories = c("Likely benign", "Ambiguous", "Likely pathogenic"),
+  colors     = c("#78B7C5", "#EBCC2A", "#EF5703"),
+  x_var      = mean_time,
+  title      = "Singletons (missense)"
+)
+```
+
+Duncan's QQ plot with 95% CIs
+```{r}
+am_df = ts_df_missense %>%
+  filter(AC_ts == 1) %>%
+  dplyr::select(
+    shape_time, scale_time, AM_pred
+  )
+
+am_qq_data_singletons <- qq_plot_data_from_df(
+  df = am_df,
+  variable = "AM_pred",
+  null_category = "Likely benign",
+  num_bootstraps=as.integer(10),
+  conf_percent = 95,
+  num_points = as.integer(1000)
+)
+
+am_qq_plot <- make_age_qq_plot(
+  am_qq_data_singletons,
+  cat_col    = category,
+  categories = c("Likely benign", "Ambiguous", "Likely pathogenic"),
+  colors     = c("#78B7C5", "#EBCC2A", "#EF5703"),
+  x_var      = null_times,
+  y_ratio    = ratio,
+  y_lower    = lower,
+  y_upper    = upper,
+  legend_title = "AlphaMissense class",
+  control_level = "Likely benign",
+)
+```
+
+### PanelApp mode of inhertiance
+Singletons box + whiskers by age
+```{r}
+moi_sing_quantiles <- make_age_cat_boxplot(
+  ts_df_missense %>%
+    filter(AC_ts == 1 & panel_app_moi %in% c("Unknown", "BIALLELIC", "MONOALLELIC")),
+  cat_col   = panel_app_moi,
+  categories = c("Unknown", "BIALLELIC", "MONOALLELIC"),
+  colors     = c("#74c476", "#238b45", "grey80"),
+  x_var      = mean_time,
+  title      = "Singletons (missense)"
+)
+```
+
+Singeltons quantiles by age
+- Category = Unknown (no inhertiance pattern)
+```{r}
+moi_df = ts_df_missense %>%
+  filter(AC_ts == 1) %>%
+  dplyr::select(
+    shape_time, scale_time, panel_app_moi
+  ) %>%
+  drop_na(panel_app_moi) %>%
+  filter(panel_app_moi %in% c("Unknown", "BIALLELIC", "MONOALLELIC")) %>%
+  mutate(
+    ## Rename the categories.
+    panel_app_moi = case_when(
+      panel_app_moi == "BIALLELIC" ~ "Recessive inheritance",
+      panel_app_moi == "MONOALLELIC" ~ "Dominant inheritance",
+      TRUE ~ "None"
+    )
+  )
+
+moi_qq_data_singletons <- qq_plot_data_from_df(
+  df = moi_df,
+  variable = "panel_app_moi",
+  null_category = "None",
+  conf_percent = as.integer(95),
+  num_bootstraps= as.integer(10),
+  num_points = as.integer(1000)
+)
+
+moi_qq_plot <- make_age_qq_plot(
+  moi_qq_data_singletons,
+  cat_col    = category,
+  categories = c("None", "Recessive inheritance", "Dominant inheritance"),
+  colors     = rev(c("#74c476", "#238b45", "grey80")),
+  x_var      = null_times,
+  y_ratio    = ratio,
+  y_lower    = lower,
+  y_upper    = upper,
+  legend_title = "PanelApp inheritance class",
+  control_level = "None",
+)
+```
+
+### PrimateAI-3D
+Box and whiskers plot
+```{r}
+pai3d_sing_quantiles <- make_age_cat_boxplot(
+  ts_df_missense %>%
+    drop_na(PAI3D_pred) %>%
+    filter(AC_ts == 1),
+  cat_col   = PAI3D_pred,
+  categories = c("Likely benign", "Ambiguous", "Likely pathogenic"),
+  colors     = c("#78B7C5", "#EBCC2A", "#EF5703"),
+  x_var      = mean_time,
+  title      = "Singletons (missense)"
+)
+```
+
+Duncan's QQ plot with 95% CIs
+```{r}
+pai3d_df = ts_df_missense %>%
+  drop_na(PAI3D_pred)%>%
+  filter(AC_ts == 1) %>%
+  dplyr::select(
+    shape_time, scale_time, PAI3D_pred
+  )
+
+pai3d_qq_data_singletons <- qq_plot_data_from_df(
+  df = pai3d_df,
+  variable = "PAI3D_pred",
+  null_category = "Likely benign",
+  num_bootstraps=as.integer(10),
+  conf_percent = 95,
+  num_points = as.integer(1000)
+)
+
+pai3d_qq_plot <- make_age_qq_plot(
+  pai3d_qq_data_singletons,
+  cat_col    = category,
+  categories = c("Likely benign", "Ambiguous", "Likely pathogenic"),
+  colors     = c("#78B7C5", "#EBCC2A", "#EF5703"),
+  x_var      = null_times,
+  y_ratio    = ratio,
+  y_lower    = lower,
+  y_upper    = upper,
+  legend_title = "PrimateAI-3D class",
+  control_level = "Likely benign",
+)
+```
+
+## Logistic regression of allele age Z-score bins vs probability of class membership
+We can test the relationship between mutation age and different classes across the ur spectrum by looking at Z-score bins.
+- AlphaMissense categories (ur)
+- PrimateAI-3D categories (ur)
+- PanelApp mode of inheritance categories (ur)
+
+### AlphaMissense classes vs Frequency controlled allele age Z-scores bins
+Make a plot of numbers of mutations per class
+```{r}
+am_n_plot <- cat_n_plot(
+  ts_df_missense,
+  cat_col      = AM_pred,
+  categories   = c("Likely pathogenic", "Ambiguous", "Likely benign"),
+  colors       = c("#EF5703", "#EBCC2A", "#78B7C5"),
+  filter_ac_ts = TRUE,
+  AF_thresh    = 0.001,
+  max_ac_fun   = max_ac_count,
+  require_non_na = AM_score,
+  x_divisor    = 1000,
+  x_label      = "Missense variants (thousands)",
+  title        = "GEL DAF < 0.1% (missense)",
+  legend_title = "AlphaMissense class",
+  show_legend  = FALSE
+)
+```
+
+Run the logistic regression loop
+```{r, message = FALSE}
+am_logistic_test_z <-
+outlier_logistic_loop_wrapper(
+  df = ts_df_missense,
+  outcome_col = "AM_pred",
+  outcome_vec = c("Likely benign", "Ambiguous", "Likely pathogenic"),
+  outlier_thresh_vec = c(-Inf, -2, -1, 0, 1, 2, 3, 4, Inf), ## trim lower cateogories.
+  outlier_col = "time_z",
+  group_vals = c(1:max_ac_count(ts_lf_merge, AF_thresh = 0.001)),
+  group_col = "AC_ts",
+  direction = "between",
+  correct_groups = FALSE,
+  group_as_factor = FALSE
+)
+
+am_logistic_test_z %<>%
+mutate(outlier_score = gsub(" - ", " to ", outlier_score),
+       outlier_score = case_when(
+        outlier_score == "-Inf to -2" ~ "< -2",
+        outlier_score == "4 to Inf" ~ "> 4",
+        TRUE ~ outlier_score
+       )) 
+```
+
+Plot...
+```{r}
+am_zcat_plot <- am_logistic_test_z %>%
+enrichment_depletion_plot(
+  group_col = "AM_pred",
+  group_vals = c("Likely benign", "Ambiguous", "Likely pathogenic"),
+  outlier_scores = unique(.$outlier_score),
+  colours_vec = c("#78B7C5", "#EBCC2A", "#EF5703"),
+)
+```
+
+### PanelApp inheritance classes vs Frequency controlled allele age Z-scores bins
+We expect that monoallelic vs biallelic inheritance would influence purifying selection.
+Is there a difference in age distributions of missense variants across clinically relevant recessive/dominant genes in terms of mutation ages, even when controlling for frequency?
+
+We can look at PanelApp (https://panelapp.genomicsengland.co.uk/) for this.
+- gel-ts_df.Rmd annotated each variant with the mode of inheritance of any PanelApp gene they overlapped with.
+
+Make a plot of numbers of missense mutations per class
+```{r}
+moi_n_plot <- cat_n_plot(
+  ts_df_missense,
+  cat_col      = panel_app_moi,
+  categories   = c("BIALLELIC", "MONOALLELIC", "Unknown"),
+  colors       = c("#238b45", "#74c476", "grey80"),
+  filter_ac_ts = TRUE,
+  AF_thresh    = 0.001,
+  max_ac_fun   = max_ac_count,
+  require_non_na = panel_app_moi,
+  x_divisor    = 1000,
+  x_label      = "Missense variants (thousands)",
+  title        = "GEL DAF < 0.1% (missense)",
+  legend_title = "PanelApp inheritance class",
+  show_legend  = FALSE
+)
+```
+
+Run the logistic regression loop
+```{r}
+moi_logistic_test_z <-
+outlier_logistic_loop_wrapper(
+   ts_df_missense,
+    filter(panel_app_moi %in% c("BIALLELIC", "Unknown", "MONOALLELIC")),
+  outcome_col = "panel_app_moi",
+  outcome_vec = c("BIALLELIC", "Unknown", "MONOALLELIC"),
+  outlier_thresh_vec = c(-Inf, -2, -1, 0, 1, 2, 3, 4, Inf),
+  outlier_col = "time_z",
+  group_vals = c(1:max_ac_count(ts_lf_merge, AF_thresh = 0.001)),
+  group_col = "AC_ts",
+  direction = "between",
+  correct_groups = FALSE,
+  group_as_factor = FALSE
+)
+
+moi_logistic_test_z %<>%
+mutate(outlier_score = gsub(" - ", " to ", outlier_score),
+       outlier_score = case_when(
+        outlier_score == "-Inf to -2" ~ "< -2",
+        outlier_score == "4 to Inf" ~ "> 4",
+        TRUE ~ outlier_score
+       ))
+```
+
+Plot...
+```{r}
+moi_zcat_plot <- moi_logistic_test_z %>%
+enrichment_depletion_plot(
+  group_col = "panel_app_moi",
+  group_vals = c("BIALLELIC", "MONOALLELIC", "Unknown"),
+  outlier_scores = unique(.$outlier_score),
+  colours_vec = c("#238b45", "#74c476", "grey80"),
+)
+```
+
+### PrimateAI-3D
+Make a plot of numbers of mutations per class
+```{r}
+pai3d_n_plot <- cat_n_plot(
+  ts_df_missense %>%
+    drop_na(PAI3D_pred),
+  cat_col      = PAI3D_pred,
+  categories   = c("Likely pathogenic", "Ambiguous", "Likely benign"),
+  colors       = c("#EF5703", "#EBCC2A", "#78B7C5"),
+  filter_ac_ts = TRUE,
+  AF_thresh    = 0.001,
+  max_ac_fun   = max_ac_count,
+  require_non_na = PAI3D_score,
+  x_divisor    = 1000,
+  x_label      = "Missense variants (thousands)",
+  title        = "GEL DAF < 0.1% (missense)",
+  legend_title = "PrimateAI-3D class",
+  show_legend  = FALSE
+)
+```
+
+Run the logistic regression loop
+```{r, message = FALSE}
+pai3d_logistic_test_z <-
+outlier_logistic_loop_wrapper(
+  df = ts_df_missense %>%
+    drop_na(PAI3D_pred),
+  outcome_col = "PAI3D_pred",
+  outcome_vec = c("Likely benign", "Ambiguous", "Likely pathogenic"),
+  outlier_thresh_vec = c(-Inf, -2, -1, 0, 1, 2, 3, 4, Inf), ## trim lower cateogories.
+  outlier_col = "time_z",
+  group_vals = c(1:max_ac_count(ts_lf_merge, AF_thresh = 0.001)),
+  group_col = "AC_ts",
+  direction = "between",
+  correct_groups = FALSE,
+  group_as_factor = FALSE
+)
+
+pai3d_logistic_test_z %<>%
+mutate(outlier_score = gsub(" - ", " to ", outlier_score),
+       outlier_score = case_when(
+        outlier_score == "-Inf to -2" ~ "< -2",
+        outlier_score == "4 to Inf" ~ "> 4",
+        TRUE ~ outlier_score
+       )) 
+```
+
+Plot...
+```{r}
+pai3d_zcat_plot <- pai3d_logistic_test_z %>%
+enrichment_depletion_plot(
+  group_col = "PAI3D_pred",
+  group_vals = c("Likely benign", "Ambiguous", "Likely pathogenic"),
+  outlier_scores = unique(.$outlier_score),
+  colours_vec = c("#78B7C5", "#EBCC2A", "#EF5703"),
+)
+```
+
+## Combined main plot
+```{r, fig.width=15.75, fig.height=13}
+missense_cat_plot <- ggarrange(
+  ggarrange(
+    ggarrange(am_sing_quantiles, am_qq_plot, align = "v", ncol = 1, heights = c(0.25, 1)),
+    ggarrange(moi_sing_quantiles, moi_qq_plot, ncol = 1, align = "v", heights = c(0.25, 1)),
+    nrow = 1
+  ),
+  NULL,
+  ggarrange(am_zcat_plot, moi_zcat_plot, nrow = 1),
+  NULL,
+  ggarrange(NULL, am_n_plot, NULL, moi_n_plot, nrow = 1, widths = c(0.07, 1, 0.04, 1)),
+  ncol = 1,
+  heights = c(0.925, 0.05, 0.9, 0.05, 0.275)
+)
+missense_cat_plot
+```
+
+Save to PDF for paper
+```{r}
+ggsave(paste0(paths$plots_dir, "tmp_alpha_missense_panelapp_freq_plot_toedit.pdf"), missense_cat_plot, width = 15.75, height = 13)
+```
+
+PrimateAI-3D supplemental plot
+```{r, fig.height=13, fig.width=7.5}
+pai3d_supp_plot <- ggarrange(
+  ggarrange(pai3d_sing_quantiles, pai3d_qq_plot, align = "v", ncol = 1, heights = c(0.25, 1)),
+  NULL,
+  pai3d_zcat_plot,
+  NULL,
+  ggarrange(NULL, pai3d_n_plot, nrow = 1, widths = c(0.07, 1)),
+  ncol = 1,
+  heights = c(0.925, 0.05, 0.9, 0.05, 0.275)
+)
+pai3d_supp_plot 
+```
+
+Save to PDF
+```{r}
+ggsave(paste0(paths$plots_dir, "primateai_3d_age_freq_plot.pdf"), pai3d_supp_plot, width = 8, height = 13)
+```
+
+## Constraint Z-score plot
+gnomADv3.1 released Z-scores showing mutational constraint across chromosomes
+We can take a look at if there is any enrichment/depletion of allele frequency / allele age outliers (Z-scores) within constraint Z-score bins.
+
+```{r}
+## takes a while, checkpoint
+checkpoint_gnocchi_regress <- paste0(paths$output_dir, "checkpoints/all-chr17-gnocchi_z-regression.tsv.gz")
+if (file.exists(checkpoint_gnocchi_regress)) {
+  gnocchi_logistic_test_between_z <- fread(
+    checkpoint_gnocchi_regress
+  )
+} else {
+  gnocchi_logistic_test_between_z <-
+  outlier_logistic_loop_wrapper(
+    df = ts_lf_merge %>%
+      filter(chromosome == "chr17"),
+    outcome_col = "gnocchi_z",
+    outcome_vec = c("<n4", "n3-n4", "n2-n3", "n1-n2", "0-n1", "0-1", "1-2", "2-3", "3-4", ">=4"),
+    outlier_thresh_vec = c(-Inf, 0, 1, 2, 3, 4, Inf),
+    outlier_col = "time_z",
+    group_vals = c(1:max_ac_count(ts_lf_merge, AF_thresh = 0.001)),
+    group_col = "AC_ts",
+    direction = "between",
+    correct_groups = FALSE,
+    group_as_factor = FALSE
+  )
+}
+
+gnocchi_logistic_test_between_z %<>%
+mutate(outlier_score = gsub(" - ", " to ", outlier_score),
+       outlier_score = case_when(
+        outlier_score == "-Inf to 0" ~ "< 0",
+        outlier_score == "4 to Inf" ~ "> 4",
+        TRUE ~ outlier_score
+       )) 
+```
+
+```{r}
+order_constraint <- c("<n4", "n3-n4", "n2-n3", "n1-n2", "0-n1", "0-1", "1-2", "2-3", "3-4", ">=4")
+gnocchi_z_plot <- gnocchi_logistic_test_between_z %>%
+enrichment_depletion_plot(
+  group_col = "gnocchi_z",
+  outlier_scores = unique(gnocchi_logistic_test_between_z$outlier_score),
+  group_vals = order_constraint
+) +
+scale_fill_viridis(option = "A", discrete = TRUE) +
+scale_color_viridis(option = "A", discrete = TRUE) +
+labs(
+  x = "Frequency-controlled age z-score bin",
+  y = "Relative P(class membership)"
+) +
+coord_cartesian(ylim = c(-0.4, 0.4)) +
+ggtitle("GEL DAF < 0.1%") +
+theme(
+    plot.title = element_text(size = rel(0.8)),  # Match axis text size
+    axis.text = element_text(size = rel(0.8))    # Adjust axis text size if needed
+  )
+```
+
+Constraint Z scores
+```{r}
+#### gnocchi constraint
+constraint_gnocchi <- fread(
+    file.path(paste0(paths$output,"all-chr17-gnocchi_constraint.tsv.gz"))
+  ) %>%
+  filter(
+    !(start > 18276569 & end < 26718757)
+  )
+```
+
+```{r}
+gnocchi_plot_constraint <- constraint_gnocchi %>%
+  mutate(
+    ymax = 1, ymin = -1,
+    gnocchi_z = factor(gnocchi_z, levels = order_constraint)
+  ) %>%
+  ggplot() +
+  theme_bw(base_size = 20) +
+  geom_rect(
+    aes(xmin = start/1e6, xmax = end/1e6,
+        ymin = ymin, ymax = ymax,
+        colour = gnocchi_z, fill = gnocchi_z),
+    alpha = 0.75
+  ) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "A", discrete = TRUE) +
+  scale_color_viridis(option = "A", discrete = TRUE) +
+  labs(
+    x = "Position (Mb)\nChromosome 17",
+    fill   = "gnocchi constraint class (z-score bin)",
+    colour = "gnocchi constraint class (z-score bin)"
+  ) +
+  guides(
+    fill = guide_legend(
+      title.position = "top",
+      title.hjust    = 0.5,
+      nrow           = 1,
+      label = FALSE,
+      keywidth  = unit(25, "pt"),
+      keyheight = unit(25, "pt")
+    ),
+    colour = "none"
+  ) +
+  theme(
+    legend.position     = "top",
+    legend.box          = "horizontal",
+    legend.title.align  = 0.5,
+    legend.spacing.x     = unit(3, "pt"),
+    panel.grid          = element_blank(),
+    axis.text.y         = element_blank(),
+    axis.title.y        = element_blank(),
+    axis.ticks.y        = element_blank()
+  ) +
+  geom_vline(xintercept = c(18276569, 26718757)/1e6, linewidth = 0.5)
+```
+
+```{r, fig.width = 10, fig.height = 6}
+gnocchi_z_score_fig <- ggarrange(
+  ggarrange(NULL, gnocchi_plot_constraint, nrow = 1, widths = c(0.07, 1)),
+  NULL,
+  gnocchi_z_plot,
+  ncol = 1,
+  heights = c(0.65, 0.05, 1)
+)
+gnocchi_z_score_fig
+```
+
+Save to PDF for paper
+```{r}
+ggsave(paste0(paths$plots_dir, "tmp_gel_constraint_gnocchi_figure_toedit.pdf"), gnocchi_z_score_fig, width = 12, height = 9)
+```
+Ill manually annotate with some stuff too.
