@@ -1,0 +1,16 @@
+prefix: "set -euo pipefail; "
+data_dir: "data"
+results_dir: "results"
+progress_dir: "progress"
+
+mutation_rate: 1.29e-08
+metadata_path: "../data/tgp/1kgp_metadata.csv"
+chr:
+ - 20
+
+methods:
+  - "tsdate"
+  - "geva"
+  - "singer"
+  - "relate"
+  - "coalNN"
