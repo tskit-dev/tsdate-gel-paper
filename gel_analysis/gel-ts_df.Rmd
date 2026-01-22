@@ -1,0 +1,1133 @@
+---
+title: "`r params$report_title`"
+author: Sam Tallman
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 2
+    number_sections: true
+params:
+    chrom: "chr17"
+    ts_tsv: "trees_singletons_july25.tsv"
+    report_title: "GEL - Creating annotated dataframe from dated trees."
+---
+
+# Packages
+
+```{r, message = FALSE}
+library(tidyverse)
+library(data.table)
+library(magrittr)
+library(rtracklayer)
+library(Rlabkey)
+library(parallel)
+library(reticulate)
+library(knitr)
+library(yaml)
+library(tidypolars)
+library(polars)
+library(glue)
+
+## virtual python environment in the singularity container...
+use_virtualenv("/opt/python_env", required = TRUE)
+```
+
+# Chromosome + TS files
+```{r, message = FALSE}
+chrom <- params$chrom
+cat("Making ts_df using chromosome:", chrom, ".")
+```
+
+# ts_df
+Some parameters
+
+```{r, message = FALSE}
+## Python functions for reticulate
+source_python("functions/gel-funcs.py")
+
+## Source R functions
+source("functions/gel-funcs.R")
+```
+
+File paths from config...
+
+```{r}
+config <- yaml::read_yaml("config/config.yaml")
+chrom_no_prefix <- gsub("^chr", "", chrom)
+
+# Fill templates
+paths <- lapply(config$paths, function(path) {
+  glue(path,
+       chrom = chrom,
+       chrom_no_prefix = chrom_no_prefix,
+       data_dir = config$paths$data_dir,
+       singletons_dir = config$paths$singletons_dir
+      )
+})
+
+# Required keys
+required_keys <- c(
+  "output_dir", "ts_dir", "pops_path", "fasta_ancestor", "aggV2_chunks",
+  "zarr_path", "zarr_ind_index", "zarr_pos_index", "netrc_file",
+  "singletons_dir", "singletons_tsv", "data_dir",
+  "gnomad_exomes_tsv", "gnomad_genomes_tsv", "ga100k_tsv",
+  "am_tsv", "pai_tsv", "denisovan_tsv", "altai_neanderthal_tsv",
+  "vindija_neanderthal_tsv", "chagyrskaya_neanderthal_tsv",
+  "gnomad_constraint_txt", "genes_ensembl", "panel_app_tsv", "clinvar_tsv"
+)
+
+# Check required keys in config.yaml
+missing_keys <- setdiff(required_keys, names(config$paths))
+if (length(missing_keys)) {
+  stop("Missing keys in config.yaml: ", paste(missing_keys, collapse = ", "))
+}
+
+# Check files/dirs
+for (key in required_keys) {
+  path_template <- config$paths[[key]]
+  full_path <- as.character(glue::glue_data(paths, path_template))
+  
+  # Decide whether it should be a file or dir
+  is_dir <- grepl("/$", path_template) && !grepl("\\{chrom", path_template)
+  
+  if (is_dir) {
+    if (!dir.exists(full_path)) {
+      warning(sprintf("Directory does not exist for key '%s': %s", key, full_path))
+    }
+  } else {
+    if (!file.exists(full_path)) {
+      warning(sprintf("File does not exist for key '%s': %s", key, full_path))
+    }
+  }
+}
+
+paths
+output_dir <- paths$output_dir
+data_dir <- paths$data_dir
+```
+
+##### How many trees for this chromosome?
+
+```{r}
+ts_tsv <- params$ts_tsv
+trees_list <- read_tsv(ts_tsv) %>%
+  filter(chromosome == chrom)
+n_trees_chrom <- trees_list %>%
+    nrow()
+cat("There are", n_trees_chrom, "tree sequences that will be used to build this df.\n")
+```
+
+## Creating annotations from the trees
+
+### Dates + initial ts_df
+Dump date information from each of the tree sequences in the list for given chromosome.
+checkpoint as this takes a while for larger trees.
+
+```{r, message = FALSE}
+dates_dir <- paste0(output_dir, "dates/")
+if (!dir.exists(dates_dir)) {
+  paste("Creating:", dates_dir , "as it does not exist\n")
+  dir.create(dates_dir , recursive = TRUE)
+}
+
+## Create the initial ts_df
+ts_df <- combine_ts_dfs(
+  chrom = chrom,
+  ts_list = ts_tsv,
+  df_suffix = "-times.tsv",
+  ts_suffix = ".trees.tsz",
+  ts_dir = paths$ts_dir,
+  df_dir = dates_dir,
+) %>%
+mutate(AF_ts = AC_ts / AN_ts) %>%
+add_date_ac_stats()
+```
+
+Some stats...
+
+```{r, message = FALSE}
+ts_start_pos <- min(ts_df$position)
+ts_end_pos <- max(ts_df$position)
+cat(
+  paste0(
+    "Data frame comprises chromosome ",
+    chrom,
+    " from position: ",
+    ts_start_pos, " to ", ts_end_pos, "\n"
+  )
+)
+```
+
+```{r, message = FALSE}
+cat(
+  paste0(
+    nrow(ts_df),
+    ' variants in the tree sequence(s).\n'
+  )
+)
+```
+
+```{r, message = FALSE}
+cat(
+  paste0(
+    nrow(ts_df %>% filter(is.na(mean_time))),
+    ' variants without associated dates.\n'
+  )
+)
+```
+
+### Add population-specific derived AC/ANs
+- pops_df was generated using _gel-gnomAD_hail_pops.py_ with gnomADv4.1 PCs and ONNX random forest models.
+```{r}
+pops_df <- read_tsv(paths$pops_path)
+nrow(pops_df)
+```
+
+- Dump ACs and ANs from tree sequences
+- Also checkpoint as this can take a while..
+
+```{r, message = FALSE}
+pops_dir <- paste0(output_dir, "pop_counts/")
+if (!dir.exists(pops_dir)) {
+  paste("Creating:", pops_dir, "as it does not exist\n")
+  dir.create(pops_dir, recursive = TRUE)
+}
+
+pops_df <- read_tsv(paths$pops_path)
+ts_pop_acs <- combine_ts_dfs(
+  chrom = chrom,
+  ts_list = ts_tsv,
+  ts_suffix = ".trees.tsz",
+  df_suffix = "-pop_counts.tsv",
+  ts_dir = paths$ts_dir,
+  df_dir = pops_dir,
+  pops_path = paths$pops_path
+)
+
+## Join with ts_df
+ts_df %<>%
+left_join(ts_pop_acs, by = c("position"))
+rm(ts_pop_acs)
+```
+
+##### Note pop specific alleles in ts_df
+- remaining: Finnish (fin) + Other (oth)  
+- afr: African  
+- nfe: Non-Finnish European  
+- amr: American  
+- mid: Middle Eastern  
+- asj: Ashkenazi Jewish  
+- sas: South Asian  
+- eas: East Asian  
+
+```{r, message = FALSE}
+## Add column denoting pop specific alleles
+ts_df %<>%
+  dplyr::select(
+    -contains(c("pop", "within"))
+  ) %>%
+  pop_specific_alleles(
+    ac_col = "AC_ts",
+    remain_collapse = c("fin", "oth")
+  )
+
+ts_df %>%
+group_by(pop) %>%
+tally()
+```
+
+### CpG sites
+- These will be removed from the majority of downstream analyses as many are very likely to be recurrents.
+
+```{r, message = FALSE}
+## Duncan's function for getting ancestral CpG sites
+chrom_cpg_sites <- find_cpg_sites(paths$fasta_ancestor)
+chrom_cpg_dinucleotides <- c(chrom_cpg_sites, (chrom_cpg_sites + 1)) # Also on reverse strand
+
+## Annotate
+ts_df %<>%
+dplyr::select(-contains("cpg_transition")) %>%
+mutate(
+  cpg_transition = case_when(
+    position %in% chrom_cpg_dinucleotides &
+    ancestral_state == "C" &
+    derived_state == "T" ~ TRUE,
+    ## Also reverse strand
+    position %in% chrom_cpg_dinucleotides &
+    ancestral_state == "G" &
+    derived_state == "A" ~ TRUE,
+    TRUE ~ FALSE
+  )
+)
+```
+
+### Mutations above or below the root
+- We may want to remove these or at least note them in downstream analyses.
+
+```{r, message = FALSE}
+root_mutations <- list()
+for (tree in 1:nrow(trees_list)) {
+  ts_path <- paste0(paths$ts_dir, trees_list[tree, 2], ".trees.tsz")
+  ## Function for finding mutations where parent is unconstrained root.
+  root_mutations[[tree]] <- parent_is_root(ts_path)
+}
+root_mutations <- unlist(unlist(recursive = FALSE, root_mutations))
+ts_df %<>%
+mutate(
+  mutation_root_parent = ifelse(position %in% root_mutations, TRUE, FALSE)
+)
+```
+
+## Joining external TSV files
+
+#### Additional parameters
+- aggV2 chunks list  
+- Path to Zarr file used to generate the trees  
+- .netrc for LabKey access  
+- Directory with singletons stored that were added to the trees + dated.
+
+```{r, message = FALSE}
+## Checkpoint the indexes
+if (file.exists(paths$zarr_ind_index) & file.exists(paths$zarr_pos_index)) {
+  cat("Zarr indices exist already.\n")
+} else {
+  ## Get positions/samples indexes
+  zarr_pos_inds_df_list <- get_zarr_pos_ind_indices(paths$zarr_path)
+  
+  ## Zarr positions index
+  zarr_pos_inds_df_list[[1]] %>%
+    dplyr::rename(position = values) %>%
+    mutate(index = rownames(.)) %>%
+    write.csv(paths$zarr_pos_index, row.names = FALSE, quote = FALSE, col.names = TRUE)
+  
+  ## Zarr individuals index
+  zarr_pos_inds_df_list[[2]] %>%
+    dplyr::rename(sgkit_sample_id = values) %>%
+    mutate(index = rownames(.)) %>%
+    write.csv(paths$zarr_ind_index, row.names = FALSE, quote = FALSE, col.names = TRUE)
+}
+```
+
+### Singleton sites
+- These are the singletons extracted from the unphased aggV2 VCFs added to the trees.
+
+```{r, message = FALSE}
+singletons <- fread(paths$singletons_tsv) %>%
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df %>% filter(AC_ts == 1),
+  flip_acs = FALSE
+) %>%
+dplyr::select(-c(GT, filter, DP, GQ)) %>%
+distinct() %>%
+dplyr::rename(
+  singleton_sample_id = sgkit_sample_id,
+) %>%
+group_by(position) %>%
+filter(singleton_sample_id == max(singleton_sample_id)) %>%
+ungroup()
+
+cat(
+  paste0(
+    "There are: ",
+    nrow(ts_df %>% filter(AC_ts == 1)),
+    " singleton sites in the tree sequences, and ",
+    nrow(singletons), " of these are in the singletons dataframe.\n"
+  )
+)
+
+## Join
+ts_df %<>%
+dplyr::select(-contains("singleton")) %>%
+left_join(
+  singletons,
+  by = c(
+    "chromosome",
+    "position",
+    "ancestral_state",
+    "derived_state"
+  )
+)
+rm(singletons)
+```
+
+### gnomAD population ACs
+- Exomes downloaded from:  https://gnomad-public-us-east-1.s3.amazonaws.com/release/4.1/vcf/exomes/  
+- Genomes downloaded from: https://gnomad-public-us-east-1.s3.amazonaws.com/release/4.1/vcf/genomes/
+
+TSV files were
+
+```{r, message = FALSE}
+# Exomes (gnomADv4.1)
+gnomad_ex_acs <- fread(paths$gnomad_exomes_tsv) %>%
+filter(filter %in% c(".", "PASS")) %>%
+dplyr::select(-c(rsid, filter)) %>%
+mutate(AC_gnomad_exomes = round(
+  AN_gnomad_exomes * AF_gnomad_exomes
+)) %>%
+relocate(
+  AC_gnomad_exomes,
+  .after = AN_gnomad_exomes
+) %>% 
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df,
+  flip_acs = TRUE
+)
+
+# Genomes (gnomADv4.1)
+gnomad_gen_acs <- fread(paths$gnomad_genomes_tsv)%>%
+filter(filter %in% c(".", "PASS")) %>%
+dplyr::select(-c(rsid, filter)) %>%
+mutate(AC_gnomad_genomes = round(
+  AN_gnomad_genomes * AF_gnomad_genomes
+)) %>%
+relocate(
+  AC_gnomad_genomes,
+  .after = AN_gnomad_genomes
+) %>% 
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df,
+  flip_acs = TRUE
+)
+
+## Combine with ts_df
+ts_df %<>%
+dplyr::select(-contains("gnomad")) %>%
+left_join(
+  gnomad_ex_acs,
+  by = c(
+    "chromosome",
+    "position",
+    "ancestral_state",
+    "derived_state"
+  )
+) %>%
+left_join(
+  gnomad_gen_acs,
+  by = c(
+    "chromosome",
+    "position",
+    "ancestral_state",
+    "derived_state"
+  )
+) %>%
+mutate(
+  AF_gnomad_exomes = AC_gnomad_exomes / AN_gnomad_exomes,
+  AF_gnomad_genomes = AC_gnomad_genomes / AN_gnomad_genomes
+) %>%
+mutate_at(
+  vars(
+    starts_with("AN") |
+    starts_with("AC") |
+    starts_with("AF")
+  ), ~replace_na(., 0)
+) %>%
+mutate(
+  in_gnomad = ifelse(
+    (AC_gnomad_genomes > 0 | AC_gnomad_exomes > 0),
+    TRUE,  FALSE
+    )
+) 
+
+## Number of variants unobserved in gnomADv4.1
+cat(paste0(
+  nrow(ts_df %>%
+      filter(AC_gnomad_genomes == 0 & AC_gnomad_exomes == 0)
+  ),
+  ' variants unobserved in gnomADv4.\n')
+)
+rm(gnomad_ex_acs); rm(gnomad_gen_acs)
+```
+
+### GenomeAsia100k AN/ACs
+- Genomes downloaded from: https://browser.genomeasia100k.org/service/web/download_files/
+
+```{r, message = FALSE}
+# Genomes (GenomeAsia100k)
+ga100k_acs <- fread(paths$ga100k_tsv, fill=TRUE) %>%
+dplyr::select(-V22) %>%
+mutate(
+  position = as.integer(position),
+  AC_ga100k_genomes = round(
+    AN_ga100k_genomes * AF_ga100k_genomes
+  )
+) %>%
+dplyr::rename(ga100k_filter = filter) %>%
+relocate(
+  AC_ga100k_genomes,
+  .after = AN_ga100k_genomes
+) %>% 
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df,
+  flip_acs = TRUE
+)
+
+ts_df %<>%
+dplyr::select(-contains("ga100k")) %>%
+left_join(
+  ga100k_acs,
+  by = c(
+    "chromosome",
+    "position",
+    "ancestral_state",
+    "derived_state"
+  )
+) %>%
+mutate_at(
+  vars(
+    starts_with("AN") |
+    starts_with("AC") |
+    starts_with("AF")
+    ), ~replace_na(., 0))
+
+cat(paste0(
+  nrow(ts_df %>%
+    filter(AC_ga100k_genomes == 0)),
+  ' variants unobserved in GenomeAsia100k.\n')
+)
+rm(ga100k_acs)
+```
+
+##### Identifiy GenomeAsia 100k common mutations with population maximum AF >1%  
+- Take only PASS variants with at least AC = 3.
+
+```{r, message = FALSE}
+ts_df %<>%
+mutate(
+  pop_ga100k_common = case_when(
+    ga100k_filter == "PASS" & AC_ga100k_genomes > 2 & (AC_oce_ga100k_genomes / AN_oce_ga100k_genomes) >= 0.01 ~ "oce",
+    ga100k_filter == "PASS" & AC_ga100k_genomes > 2 & (AC_afr_ga100k_genomes / AN_afr_ga100k_genomes) >= 0.01 ~ "afr",
+    ga100k_filter == "PASS" & AC_ga100k_genomes > 2 & (AC_sea_ga100k_genomes / AN_sea_ga100k_genomes) >= 0.01 ~ "sea",
+    ga100k_filter == "PASS" & AC_ga100k_genomes > 2 & (AC_wer_ga100k_genomes / AN_wer_ga100k_genomes) >= 0.01 ~ "wer",
+    ga100k_filter == "PASS" & AC_ga100k_genomes > 2 & (AC_nea_ga100k_genomes / AN_nea_ga100k_genomes) >= 0.01 ~ "nea",
+    ga100k_filter == "PASS" & AC_ga100k_genomes > 2 & (AC_sas_ga100k_genomes / AN_sas_ga100k_genomes) >= 0.01 ~ "sas",
+    TRUE ~ "none"
+  ),
+  ga100k_common = ifelse(
+    pop_ga100k_common != "none",
+    FALSE,
+    TRUE
+  )
+)
+```
+
+### Canonical transcripts
+- Canonical transcripts from ENSEMBL are downloaded from: https://ftp.ensembl.org/pub/release-111/gtf/homo_sapiens/Homo_sapiens.GRCh38.111.gtf.gz
+
+```{r, message = FALSE}
+### Transcripts from ENSEMBL
+ensembl_chrom <- readGFF(paths$genes_ensembl) %>%
+  mutate(chromosome = paste0("chr", seqid)) %>%
+  filter(chromosome == chrom & tag %in% c("MANE_Select", "Ensembl_canonical")) 
+
+## Canonical transcripts
+canon_transcripts <- ensembl_chrom %>%
+  filter(
+    transcript_biotype == "protein_coding"
+  ) %>%
+  pull(transcript_id) %>%
+  unique()
+
+length(canon_transcripts)
+```
+
+### aggV2 VEP chunks
+
+restrict to chunks overlapping the ts_df
+```{r, message = FALSE}
+### Initial VEP files are split into chunks
+aggV2_chunks <- fread(paths$aggV2_chunks)
+colnames(aggV2_chunks) <- c("chromosome", "start", "end")
+aggV2_chunks %<>%
+  filter(
+    chromosome == chrom &
+    start <= ts_end_pos &
+    end >= ts_start_pos
+  )
+head(aggV2_chunks)
+```
+
+### Annotate VEP chunks
+
+```{r, message = FALSE}
+### Get VEP consequences
+vep_annots <- annotate_vep_chunks(
+  vep_dir = paste0(data_dir, "vep_chunks/"),
+  vep_suffix = "-VEP109.tsv.gz",
+  consequence_vector = c(
+    "missense_variant",
+    "splice_region_variant",
+    "stop_gain",
+    "start_lost",
+    "stop_lost",
+    "synonymous_variant",
+    "splice_donor_variant",
+    "splice_acceptor_variant"
+  ),
+  chunks_tsv = aggV2_chunks,
+  transcript_ids_vector = canon_transcripts
+) %>%
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df,
+  flip_acs = FALSE,
+  exclude_derived_refs = TRUE
+) %>%
+filter(gene_symbol != ".") %>%
+## Some variants will have multiple rows..
+group_by(
+  chromosome,
+  position,
+  ancestral_state,
+  derived_state,
+  rsid
+) %>%
+summarise_all(toString)
+
+## Defintition from Genomics England rare diseases pipeline...
+pavs_str <- "missense|splice_region|splice_donor|start_lost|start_gained|splice_acceptor|stop_gained|stop_lost"
+## Join
+ts_df %<>%
+left_join(vep_annots) %>%
+mutate(pav = ifelse(grepl(pavs_str, consequence), "pav", "not pav"))
+```
+
+### Missense effect predictions
+- AlphaMissense scores  
+- PrimateAI-3D scores  
+
+```{r, message = FALSE}
+### AlphaMissense Scores
+am_scores <- fread(paths$am_tsv) %>%
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df,
+  flip_acs = FALSE,
+  exclude_derived_refs = TRUE
+) %>%
+group_by(position) %>%
+filter(AM_score == max(AM_score)) %>%
+ungroup() %>%
+distinct()
+
+### PrimateAI-3D Scores
+pai3d_scores <- fread(paths$pai_tsv) %>%
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df,
+  flip_acs = FALSE,
+  exclude_derived_refs = TRUE
+) %>%
+group_by(position) %>%
+filter(PAI3D_score == max(PAI3D_score)) %>%
+ungroup() %>%
+distinct()
+
+## Join with 
+ts_df %<>%
+left_join(
+  am_scores,
+  by = c(
+    "chromosome",
+    "position",
+    "ancestral_state",
+    "derived_state"
+  )
+) %>%
+left_join(
+  pai3d_scores,
+  by = c(
+    "chromosome",
+    "position",
+    "ancestral_state",
+    "derived_state"
+  )
+)
+```
+
+### Archaic genomes
+- Altai Denisovan  
+- Altai Neanderthal  
+- Vindija Neanderthal  
+- Chagyrskaya Neanderthal  
+
+```{r, message = FALSE}
+## Get reference alleles from the VEP files..
+hg38_reference <- 
+annotate_vep_chunks(
+  vep_dir = paste0(data_dir, "vep_chunks/"),
+  chunks_tsv = aggV2_chunks,
+  vep_suffix = "-VEP109.tsv.gz"
+) %>%
+dplyr::select(c(
+  chromosome,
+  position,
+  reference,
+  alternate
+)) %>%
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df,
+  flip_acs = FALSE,
+  exclude_derived_refs = FALSE,
+  remove_reference_is = FALSE
+) %>%
+distinct()
+```
+
+```{r}
+## denisovan
+altai_denisovan <- read_tsv(paths$denisovan_tsv) %>%
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df
+) %>%
+encode_archaic_genotypes(
+  ts_alleles_ref_is = hg38_reference,
+  genotype_col = "gt_denisovan_altai",
+  filter_col = "filter_denisovan_altai",
+  filter_alleles = c(".", "PASS", NA_character_)
+) %>%
+distinct()
+```
+
+```{r}
+## 3 high-coverage neanderthals
+altai_neanderthal <- read_tsv(paths$altai_neanderthal_tsv) %>%
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df
+) %>%
+encode_archaic_genotypes(
+  ts_alleles_ref_is = hg38_reference,
+  genotype_col = "gt_neanderthal_altai",
+  filter_col = "filter_neanderthal_altai",
+  filter_alleles = c(".", "PASS", NA_character_)
+) %>%
+distinct()
+
+vindija_neanderthal <- read_tsv(paths$vindija_neanderthal_tsv) %>%
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df
+) %>%
+encode_archaic_genotypes(
+  ts_alleles_ref_is = hg38_reference,
+  genotype_col = "gt_neanderthal_vindija",
+  filter_col = "filter_neanderthal_vindija",
+  filter_alleles = c(".", "PASS", NA_character_)
+) %>%
+distinct()
+
+chagyrskaya_neanderthal <- read_tsv(paths$chagyrskaya_neanderthal_tsv) %>%
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df
+) %>%
+encode_archaic_genotypes(
+  ts_alleles_ref_is = hg38_reference,
+  genotype_col = "gt_neanderthal_chagyrskaya",
+  filter_col = "filter_neanderthal_chagyrskaya",
+  filter_alleles = c(".", "PASS", NA_character_)
+) %>%
+distinct()
+```
+
+## Join with ts_df
+
+```{r}
+ts_df %<>%
+dplyr::select(-contains(c(
+  "denisovan_altai",
+  "neanderthal_altai", 
+  "neanderthal_vindija",
+  "neanderthal_chagyrskaya"
+))) %>%
+left_join(
+  altai_denisovan, by = c(
+    "chromosome",
+    "position",
+    "ancestral_state",
+    "derived_state"
+  )
+) %>%
+left_join(
+  altai_neanderthal, by = c(
+    "chromosome",
+    "position",
+    "ancestral_state",
+    "derived_state"
+  )
+) %>%
+left_join(
+  vindija_neanderthal, by = c(
+    "chromosome",
+    "position",
+    "ancestral_state",
+    "derived_state"
+  )
+) %>%
+left_join(
+  chagyrskaya_neanderthal, by = c(
+    "chromosome",
+    "position",
+    "ancestral_state",
+    "derived_state"
+  )
+) %>%
+mutate(
+  in_archaics = ifelse(
+    (gt_denisovan_altai == "0/0" &
+    gt_neanderthal_altai == "0/0" &
+    gt_neanderthal_vindija == "0/0" &
+    gt_neanderthal_chagyrskaya == "0/0"),
+    FALSE,
+    TRUE
+  )
+)
+```
+
+## Annotating using windows
+
+### 1kb Constraint
+gnocchi Z-scores for gnomADv4.1 downloaded from: https://gnomad-public-us-east-1.s3.amazonaws.com/release/3.1/secondary_analyses/genomic_constraint/constraint_z_genome_1kb.raw.download.txt.gz
+
+```{r, message = FALSE}
+## gnomAD constraint (gnocchi)
+constraint_gnocchi <- fread(paths$gnomad_constraint_txt) %>%
+dplyr::rename(chromosome = chrom) %>%
+filter(chromosome == chrom & !is.na(z)) %>%
+mutate(
+  gnocchi_z = case_when(
+    z >= 4 ~ ">=4",
+    z >= 3 & z < 4 ~ "3-4",
+    z >= 2 & z < 3 ~ "2-3",
+    z >= 1 & z < 2 ~ "1-2",
+    z >= 0 & z < 1 ~ "0-1",
+    z >= -1 & z < 0 ~ "0-n1",
+    z >= -2 & z < -1 ~ "n1-n2",
+    z >= -3 & z < -2 ~ "n2-n3",
+    z >= -4 & z < -3 ~ "n3-n4",
+    z < -4 ~ "<n4"
+  )
+) %>%
+dplyr::select(
+  start,
+  end,
+  gnocchi_z
+) %>%
+distinct() %>%
+filter(start >= ts_start_pos & end <= ts_end_pos) %>%
+mutate(start = start + 1)
+## Otherwise the overlap is ambiguous for some mutations...
+
+### Add overlapping gnocchi z-scores
+ts_df %<>%
+dplyr::select(-contains("gnocchi_z")) %>%
+windows_overlaps(
+  windows_df = constraint_gnocchi,
+  positions_only = TRUE
+)
+```
+
+### PanelApp 'Green' Genes MOI annotation
+- PanelApp panels downloaded from https://panelapp.genomicsengland.co.uk/panels/ (11/11/24)
+
+```{r, message = FALSE}
+## panel app data
+panel_app_data <-
+read_tsv(paths$panel_app_tsv) %>%
+filter(
+  confidence == 3 & # Only "Green" genes
+  ensembl_id %in% ensembl_chrom$gene_id # Only take those in the gene_id list for this chromosome
+) %>%
+mutate(
+  panel_app_moi = case_when(
+    grepl("MONOALLELIC", mode_of_inheritance) ~ "MONOALLELIC",
+    grepl("BIALLELIC", mode_of_inheritance) ~ "BIALLELIC",
+    grepl("BOTH", mode_of_inheritance) ~ "BOTH",
+    TRUE ~ NA_character_
+ )
+) %>%
+dplyr::select(
+  ensembl_id,
+  panel_app_moi
+) %>%
+distinct() %>%
+group_by(ensembl_id) %>%
+mutate(
+  panel_app_moi = ifelse(
+    n() > 1, "BOTH", panel_app_moi
+  )
+) %>%
+distinct()
+
+## Get start-end positions from canonical transcripts
+pa_canon_transcripts <- ensembl_chrom %>%
+filter(type == "transcript") %>%
+dplyr::select(
+  chromosome,
+  start,
+  end,
+  gene_id
+) %>%
+distinct() %>%
+dplyr::rename(ensembl_id = gene_id) %>%
+left_join(panel_app_data, by = "ensembl_id") %>%
+mutate(
+  panel_app_moi = ifelse(is.na(panel_app_moi), "Unknown", panel_app_moi)
+)
+
+## What are the PanelApp moi for transcripts in this chromosome?
+pa_canon_transcripts %>% group_by(panel_app_moi) %>% tally()
+```
+
+```{r}
+# Join with ts_df
+ts_df %<>%
+dplyr::select(-contains("panel_app_moi")) %>%
+windows_overlaps(
+  windows_df = pa_canon_transcripts %>%
+    dplyr::select(
+      start, end, panel_app_moi
+    ),
+  positions_only = TRUE,
+  type_overlap = "within"
+)
+```
+
+## Annotating using LabKey SQL dataframes
+Some configuration...
+
+```{r, message = FALSE}
+baseUrl <- "https://labkey-embassy.gel.zone/labkey/"
+labkey.setDefaults(baseUrl = baseUrl)
+labkey.setDebugMode(FALSE)
+labkey.setWafEncoding(FALSE)
+labkey.setCurlOptions(NETRC_FILE = paths$netrc_file)
+```
+
+### Clinical Mutations
+- ClinVar SNPs downloaded from: https://ftp.ncbi.nlm.nih.gov/pub/clinvar/tab_delimited/archive/variant_summary_2024-04.txt.gz  
+- We want to align clinvar classification labels with ACMG classifications in GEL LabKey.
+
+```{r, message = FALSE}
+## Create the clinvar data-frame.
+clinvar_snvs <- fread(paths$clinvar_tsv) %>%
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df,
+  flip_acs = FALSE,
+  exclude_derived_refs = TRUE
+) %>%
+clinvar_to_exit_encode_acmg(clin_sig_col = "clinvar_significance")
+```
+
+##### Download GEL clinical classifications from LabKey tables v18 release.
+- 100kG exit questionaire  
+- Diagnostic Discovery  
+- GMS exit questionaire
+
+```{r, message = FALSE}
+## For exit / dd
+labkey <- "/main_programme/main-programme_v18_2023-12-21"
+exit_100kG_snvs <- pull_exit_100k(labkey = labkey) %>%
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df,
+  flip_acs = FALSE,
+  exclude_derived_refs = TRUE
+)
+
+dd_100kG_snvs <- pull_diagnostic_discovery(labkey = labkey) %>%
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df,
+  flip_acs = FALSE,
+  exclude_derived_refs = TRUE
+)
+
+## For GMS
+labkey <- "/nhs-gms/nhs-gms-release_v4_2024-08-22"
+exit_gms_snvs <- pull_exit_gms(labkey = labkey) %>%
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df,
+  flip_acs = FALSE,
+  exclude_derived_refs = TRUE
+)
+```
+
+##### Join the clinical SNVs, and encode into broader categories
+
+```{r, message = FALSE}
+## Just broad clinical codes
+clinical_snvs <- rbind(
+  clinvar_snvs %>%
+  dplyr::select(
+    chromosome,
+    position,
+    ancestral_state,
+    derived_state,
+    acmg_classification
+  ),
+  dd_100kG_snvs,
+  exit_gms_snvs,
+  exit_100kG_snvs
+) %>%
+distinct() %>%
+broad_acmg_encoder()
+
+## Join with ts_df
+ts_df %<>%
+left_join(
+  clinical_snvs,
+  by= c(
+    "chromosome",
+    "position"
+  )
+)
+```
+
+### deNovo mutations
+deNovo mutations are from a different variant callers.
+- Platypus deNovo set  
+- Tiered deNovo variants
+
+We'll have to check they are actually genotyped in the correct person in the trees.
+Utilising the zarr files is a quicker way of checking individual deNovo genotypes...
+
+```{r, message = FALSE}
+## LabKey folder
+labkey <- "/main_programme/main-programme_v18_2023-12-21"
+## sgkit_sample_id to participant_id | family_id mappings
+sample_mappings <- pull_sample_id_mappings(
+  labkey = labkey,
+  ts_sample_ids = pops_df$sgkit_sample_id
+)
+
+### deNovo set from platypus
+denovo_platypus <- pull_denovo_platypus(
+  labkey = labkey,
+  chroms = gsub("chr", "", chrom),
+  sample_mappings = sample_mappings
+) %>%
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df,
+  exclude_derived_refs = TRUE
+)
+
+### deNovo set from tiering
+denovo_tiered <- pull_denovo_tiered(
+  labkey = labkey,
+  chroms = gsub("chr", "", chrom),
+  sample_mappings = sample_mappings
+) %>%
+filt_to_ts_align_ancestor(
+  ts_alleles = ts_df,
+  exclude_derived_refs = TRUE
+)
+
+## deNovos from platypus + tiering
+denovos <- rbind(
+  denovo_platypus,
+  denovo_tiered
+  ) %>%
+  distinct() %>%
+  left_join(
+  ts_df %>%
+    dplyr::select(
+      position, AC_ts, singleton_sample_id
+    )
+  )
+
+# Singletons can be checked easily. Most won't be in the Zarr file anyway.
+denovos_singletons <- denovos %>%
+  filter(
+    AC_ts == 1 &
+    singleton_sample_id == sgkit_sample_id
+  ) %>%
+  dplyr::select(
+    chromosome,
+    position
+  ) %>%
+  distinct() %>%
+  mutate(denovo_mutation = "deNovo mutation")
+```
+
+Get deNovo recurrents
+Check they are actually genotyped in those individuals.
+Easiest to look at genotypes in Zarrs.
+
+```{r}
+### Get indexes for Zarrs.
+zarr_ind_vec <- fread(paths$zarr_ind_index) %>%
+  pull(sgkit_sample_id)
+zarr_pos_vec <- fread(paths$zarr_pos_index) %>%
+  pull(position)
+denovos_recur <- denovos %>%
+  filter(AC_ts != 1)
+
+denovos_recur_checked <- 
+  check_individual_genotype(
+    df = denovos_recur,
+    zarr_path = paths$zarr_path,
+    zarr_pos = zarr_pos_vec,
+    zarr_ind = zarr_ind_vec
+  ) %>%
+  filter(sample_varies == TRUE) %>%
+  dplyr::select(
+    chromosome,
+    position
+  ) %>%
+  distinct() %>%
+  mutate(denovo_mutation = "deNovo mutation")
+
+### Join with ts_df
+ts_df %<>%
+dplyr::select(-contains("denovo")) %>%
+left_join(
+  rbind(
+    denovos_singletons,
+    denovos_recur_checked
+  ),
+  by = c(
+    "chromosome",
+    "position"
+  )
+) %>%
+mutate(
+  denovo_mutation = ifelse(
+    is.na(denovo_mutation),
+    "Not deNovo mutation or unknown",
+    denovo_mutation
+  )
+)
+```
+
+# Final ts_df dataframe
+
+```{r, message = FALSE}
+colnames(ts_df)
+```
+
+```{r, message = FALSE}
+cat("Final ts_df is", nrow(ts_df), "rows by",length(colnames(ts_df)), "columns in size.\n")
+```
+
+##### Write to file..
+- TSV
+- Parquet (files are big...)
+
+```{r, message = FALSE}
+ts_df %>%
+  arrange(position) %>%
+  fwrite(file.path(paste0(output_dir, "all-", chrom, "-df.tsv.gz")), sep = "\t")
+
+polars::as_polars_df(ts_df)$
+  sort("position") |>
+  tidypolars::write_parquet_polars(
+    file.path(output_dir, paste0("all-", chrom, "-df.parquet")),
+    compression = "zstd"   # or "snappy"
+  )
+```
+
+Also write files for plotting
+
+```{r}
+constraint_gnocchi %>%
+  fwrite(file.path(paste0(output_dir, "all-", chrom, "-gnocchi_constraint.tsv.gz")), sep = "\t")
+
+pa_canon_transcripts %>%
+  fwrite(file.path(paste0(output_dir, "all-", chrom, "-panel_app_transcripts.tsv.gz")), sep = "\t")
+```

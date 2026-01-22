@@ -1,0 +1,1181 @@
+---
+title: "GEL - Allele age and ancestral diversity"
+author: Sam Tallman
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+    self_contained: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 4
+    number_sections: true
+    code_folding: hide
+params:
+    ts_tsv: "trees_singletons_july25.tsv"
+---
+
+# Packages
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+```{r, message = FALSE}
+library(tidyverse)
+library(data.table)
+library(MASS)
+library(magrittr)
+library(viridis)
+library(broom)
+library(Rcpp)
+library(cowplot)
+library(ggpubr)
+library(zoo)
+library(reticulate)
+library(polars)
+library(tidypolars)
+library(glue)
+library(scales)
+library(purrr)
+
+## conda environment.
+use_virtualenv("/opt/python_env", required = TRUE)
+```
+
+# Parameters
+```{r, message = FALSE}
+## Python functions for reticulate
+source_python("functions/gel-funcs.py")
+
+## Source R functions
+source("functions/gel-funcs.R")
+source("functions/gel-plotting_funcs.R")
+```
+
+File paths from config...
+```{r}
+config <- yaml::read_yaml("config/config.yaml")
+
+# Fill templates
+paths <- lapply(config$paths, function(path) {
+  if (grepl("\\{chrom\\}|\\{chrom_no_prefix\\}", path)) {
+    return(NULL)   # skip chrom-templated paths
+  }
+  glue(path,
+       data_dir       = config$paths$data_dir,
+       singletons_dir = config$paths$singletons_dir
+  )
+})
+
+paths <- Filter(Negate(is.null), paths)
+```
+
+Paths and information from the dated trees
+```{r}
+## List of trees (with singletons included)
+ts_tsv <- params$ts_tsv
+trees_list <- read_tsv(ts_tsv)
+ts_dir <- paths$ts_dir
+ts_suffix <- ".trees.tsz"
+```
+
+# Data
+
+We read in the relevant data from chromosomes
+- Generated using gel_ts-df.Rmd
+```{r, message = FALSE}
+# Extract relevant columns from the ts_df for all chromosomes
+selected_columns <- c(
+    "chromosome",
+    "position",
+    "ancestral_state",
+    "derived_state",
+    "ts_name",
+    "AC_ts",
+    "AF_ts",
+    "cpg_transition",
+    "shape_time",
+    "scale_time",
+    "AC_oce_ga100k_genomes",
+    "AN_oce_ga100k_genomes",
+    "upper_conf_time",
+    "lower_conf_time",
+    "sd_time",
+    "cv_time",
+    "in_gnomad",
+    "mean_time",
+    "mutation_root_parent",
+    "pop",
+    "singleton_sample_id"
+  )
+```
+
+Lazy loading for filtering etc.
+We exclude:
+- Mutations below the unconstrained root
+- Mutations without any dates in the tree sequences
+See outputs of gel-summary_stats.Rmd for numbers of these specific mutations
+```{r}
+ts_lf_merge <- scan_parquet_polars(file.path(paths$output_dir, "all-chr*-df.parquet")) |>
+  dplyr::select(all_of(selected_columns)) |>
+  compute() |>
+  filter(
+    mutation_root_parent == FALSE & !is.na(mean_time)
+  )
+```
+
+# Analysis
+## PCA groupings
+PCA groupings were generated previously using the assign_gnomad_pop_hail.py
+- Using the gnomADv4.1 publicly available PCA loadings + random forest from: https://gnomad.broadinstitute.org/data#v4
+```{r}
+pops_df <- read_tsv(paths$pops_path)
+## Put "oth" + "fin" into remaining
+remain_collapse <- c("fin", "oth")
+pops_no_remaining <- pops_df |>
+filter(
+  !pop %in% remain_collapse
+)
+
+pops_df <- pops_df |>
+  mutate(pop = ifelse(pop %in% remain_collapse, "remaining", pop))
+
+### Consistent colouring...
+pop_colours_vec <- c(
+  "#CC79A7", "#F0E442", "#0072B2", "#D55E00", "grey80", "#009E73", "#E69F00", "#56B4E9"
+)
+```
+
+Tally numbers of individuals per PCA group
+```{r, message = FALSE}
+group_numbers <-
+  pops_df |>
+  count(pop) |>
+  arrange(n) |>
+  mutate(
+    pop = factor(pop, levels = pop),
+    Dataset = "GEL"
+  ) |>
+  mutate(prop = n / sum(n))
+
+knitr::kable(group_numbers, bookends = FALSE)
+```
+
+As expected given this UK-based cohort the number of individuals labelled as "nfe" i.e. Non-Finnish European is highly over-represented.
+
+Plot group numbers as bar plot
+```{r}
+plot_4a_legend <- group_numbers |>
+pop_strat_bar_plot(
+  legend_text_size = 20,
+  legend_title_size = 20
+) +
+labs(
+  x = "",
+  y = "Number of individuals (thousands)"
+) +
+scale_colour_manual(
+  values = pop_colours_vec
+) +
+scale_fill_manual(
+  values = pop_colours_vec
+) +
+theme(
+  legend.position = "top"
+)
+
+## Legend for the entire figure
+plot_4_legend <- as_ggplot(
+  get_legend(plot_4a_legend)
+)
+
+## Only bar
+plot_4a <- plot_4a_legend +
+theme(
+  legend.position = "none"
+)
+```
+
+## Ind vs all pairwise coalescence
+
+How does the over-representation of European ancestry individuals impact coalescences within the trees?
+
+We'll restrict to unrelated individuals to avoid inflation...
+```{r}
+## Unrelated pops
+unrel_pops <- pops_df |>
+unrelated_filter(
+  sample_col = "sgkit_sample_id",
+  aggV2_kinship_matrix = paths$aggV2_kinship_matrix,
+  kinship_coefficient = 0.0442
+)
+```
+
+Get ~500 inidividuals from each pop.
+- Or less if pop n < 500
+```{r}
+num_samples <- 500 # Maximise as 500 samples...
+coal_sample_ids <- paste0(paths$output_dir, "checkpoints/coal_sample.ids")
+if (!file.exists(coal_sample_ids)) {
+  sampled_ids <- unrel_pops %>%
+    filter(pop != "fin") %>%
+    group_by(pop) %>%
+    group_modify(~ sample_n(.x, size = min(nrow(.x), num_samples))) %>%  # Allow variable n
+    ungroup() %>%
+    pull(sgkit_sample_id)
+  write_tsv(
+    as.data.frame(sampled_ids), coal_sample_ids
+  )
+} else {
+  sampled_ids <- read_tsv(coal_sample_ids) %>%
+    pull(sampled_ids)
+}
+```
+
+We'll restrict to the largest chromosome chunk...
+```{r}
+ts_path = paste0(ts_dir, "all-chr17q45M~83M-filterNton23SiteDensity-truncate-0-0-0-mm0-post-processed-simplified-SDN-singletons-dated", ts_suffix)
+```
+
+```{r, message = FALSE}
+pair_coal_one <- function(
+  sample_id,
+  ts_path,
+  out_dir = paste0(paths$data_dir, "pair_coal_counts/chr17q45M~83M/"),
+  time_min = 1e1,
+  time_max = 2e5,
+  bin_width = 10,
+  overwrite = FALSE
+) {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  outfile <- file.path(out_dir, sprintf("%s_pair_coal_counts.tsv", sample_id))
+
+  # If checkpoint exists and not overwriting, return it
+  if (file.exists(outfile) && !overwrite) {
+    message("✓ Exists: — reading cached file.")
+    return(
+      readr::read_tsv(outfile, show_col_types = FALSE) |>
+      mutate(sgkit_sample_id = sample_id)
+    )
+  }
+
+  # Call the Python function
+  df_py <- indiv_vs_all_pair_coal_counts(
+    ts_path = ts_path,
+    focal_sample_id = sample_id,
+    time_min = time_min,
+    time_max = time_max,
+    bin_width = bin_width
+  )
+
+  df <- reticulate::py_to_r(df_py) |>
+    mutate(sgkit_sample_id = sample_id)
+
+  message("  → Wrote")
+  readr::write_tsv(df, outfile)
+  df
+}
+
+pair_coal_many <- function(
+  sample_ids,
+  ts_path,
+  out_dir = paste0(paths$data_dir, "pair_coal_counts/chr17q45M~83M/"),
+  time_min = 1e1,
+  time_max = 2e5,
+  bin_width = 10,
+  overwrite = FALSE,
+  progress = TRUE
+) {
+  sample_ids <- unique(stats::na.omit(sample_ids))
+  res <- lapply(sample_ids, function(sid) {
+    if (progress) message("⇢ ", sid)
+    pair_coal_one(
+      sample_id = sid,
+      ts_path = ts_path,
+      out_dir = out_dir,
+      time_min = time_min,
+      time_max = time_max,
+      bin_width = bin_width,
+      overwrite = overwrite
+    )
+  })
+  dplyr::bind_rows(res)
+}
+```
+
+Wrangling of the data
+- This could have been done easier, but I wrote very granular time windows for flexibility...
+```{r}
+coal_inds_wrangled_df <- paste0(paths$output_dir, "checkpoints/coal_counts_plot.csv")
+if (file.exists(coal_inds_wrangled_df)) {
+  coal_inds <- read_csv(coal_inds_wrangled_df)
+} else {
+  pair_coal_all <-
+    pair_coal_many(
+       sampled_ids,
+       ts_path = ts_path
+    )
+  num_bins <- 50  # Adjust as needed
+  window_bounds <- 10^seq(
+    log10(min(coals$time_windows, na.rm = TRUE)), 
+    log10(max(coals$time_windows[is.finite(coals$time_windows)], na.rm = TRUE)), 
+    length.out = num_bins + 1
+  )
+  coal_inds <- pair_coal_all %>%
+    left_join(unrel_pops, by = "sgkit_sample_id") %>%
+    mutate(pop = ifelse(pop == "oth", "remaining", pop)) %>%
+    mutate(pop = factor(pop, levels = group_numbers$pop)) %>%
+    mutate(window = cut(time_windows, breaks = window_bounds, include.lowest = TRUE)) %>%
+    group_by(window, individual_id) %>%
+    summarise(
+      pop = first(pop),  # Preserve population info
+      rolling_avg = mean(pair_coal_counts, na.rm = TRUE),
+      start_time = min(time_windows, na.rm = TRUE),
+      end_time = max(time_windows, na.rm = TRUE),
+      .groups = "drop"
+    )
+  write_csv(coal_inds, coal_inds_wrangled_df)
+}
+```
+
+Get pop average coalescence counts...
+```{r}
+coals_pops <- coal_inds %>%
+  group_by(pop, window) %>%
+  reframe(pop_avg = mean(rolling_avg, na.rm = TRUE), .groups = "drop", start_time = start_time)
+```
+
+Generate the plot...
+```{r, fig.height = 7, fig.width = 7}
+# lazy, add the same figure legend..
+supp_legend <- 
+get_legend(group_numbers |>
+  pop_strat_bar_plot(
+    base_size = 15
+  ) +
+  scale_colour_manual( values = pop_colours_vec) +
+  scale_fill_manual(values = pop_colours_vec)
+)
+coal_ind_vs_all_pops <- plot_coalescence(
+  coal_inds, coals_pops,
+  order_vec = group_numbers$pop,
+  facet = FALSE, pop_colours_vec = pop_colours_vec
+)
+plot_show_coal <-
+  ggarrange(
+    supp_legend,
+    NULL,
+    coal_ind_vs_all_pops,
+    ncol = 1, heights = c(0.15, 0.05, 1)
+  )
+plot_show_coal
+```
+
+Write to plot data...
+```{r}
+ggsave(paste0(paths$plots_dir, "ind_vs_all_pop_pair_coal_counts.pdf"), plot_show_coal, height = 7, width = 7)
+```
+
+## Alleles and ages by PCA group
+Defined ultra-rare variants AC count in GEL
+- Define as less than 1 in 1000 haplotypes
+```{r}
+ur_ac_count <- max_ac_count(ts_lf_merge, AF_thresh = 0.001)
+ur_ac_count 
+```
+
+```{r}
+pop_order_w_nonspecific <- c(as.character(group_numbers$pop), "nonspecific")
+```
+
+Look at how many variants are specific to given pop at a given AC bin
+- Up to ultra-rare 0.1% threshold
+```{r}
+df_counts <- ts_lf_merge %>%
+  group_by(pop, AC_ts) %>%
+  summarise(
+    n = n(),
+    gmean_age = exp(mean(log(mean_time)))
+  ) |> 
+  as_tibble() |>
+  ungroup()
+
+comp_trunc_ur <-  df_counts %>%
+  filter(AC_ts < ur_ac_count) %>%
+  mutate(
+    log_gm    = log(gmean_age)
+  ) %>%
+  group_by(AC_ts, pop) %>%
+  summarise(
+    log_gm = weighted.mean(log_gm, w = n, na.rm = TRUE),  # uses original n vector
+    n      = sum(n),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    gmean_age = exp(log_gm)
+  ) %>%
+  group_by(AC_ts) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() |>
+  mutate(
+    pop = factor(pop, levels = pop_order_w_nonspecific)
+  )
+```
+
+Plot this
+```{r}
+pca_counts_by_ac <- ggplot(comp_trunc_ur, aes(x = AC_ts, y = prop, fill = pop, colour = pop)) +
+  geom_col(position = "stack", width = 1) +
+  scale_y_continuous(labels = label_percent(), expand = c(0, 0)) +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(x = "", y = "% of variants at AC", fill = "PCA group") +
+  theme_bw(base_size = 20) +
+  theme(
+    axis.text.x = element_text(size = 1, colour = "white"),
+    axis.ticks.x = element_blank(),
+    legend.position = "top",
+    panel.grid = element_blank()
+  ) +
+  scale_fill_manual(
+    values = c(pop_colours_vec, "grey50")
+  ) +
+  scale_colour_manual(
+    values = c(pop_colours_vec, "grey50"), guide = "none"
+  ) 
+```
+
+Vast majority of variants of higher AC counts are non-specific
+
+Summarise geometric mean age distributions...
+```{r}
+comp_trunc_ur %<>%
+ filter(n > 15) # remove intervals with < 15 mutations
+pca_age_by_ac <- ggplot(comp_trunc_ur, aes(x = AC_ts, y = gmean_age, colour = pop, fill = pop, group = pop)) +
+  geom_point(shape = 21) +
+  geom_smooth() +
+  theme_classic(base_size = 20) +
+  theme(
+    legend.position = "NONE",
+    axis.ticks.x = element_blank()
+  ) +
+  scale_y_log10(
+      expand = c(0,0),
+      breaks = scales::trans_breaks("log10", function(z) 10^z),
+      labels = scales::trans_format("log10", scales::math_format(10^.x))
+    ) + 
+  scale_x_continuous(expand = c(0,0)) +
+  annotation_logticks(sides = "l", linewidth = 0.5, colour = "grey20") +
+  scale_fill_manual(
+    values = c(pop_colours_vec, "grey50")
+  ) +
+  scale_colour_manual(
+    values = c(pop_colours_vec, "grey50")
+  ) +
+  labs(x = "Derived allele count (DAC)", y = "Geometric mean allele age\ngenerations ago")
+```
+
+Combine the two plots for a Supplementary figure
+```{r, fig.width = 10, fig.height = 8}
+comb_age_by_ac_pca <- plot_grid(
+  pca_counts_by_ac,
+  pca_age_by_ac,
+  rel_heights = c(0.75, 1),
+  labels = c("a", "b"),
+  ncol = 1, align = "v"
+)
+comb_age_by_ac_pca 
+```
+
+Write to plot data...
+```{r}
+ggsave(paste0(paths$plots_dir, "pops_geomean_age_by_ac.pdf"), comb_age_by_ac_pca , height = 8, width = 9)
+```
+
+## Singletons by PCA group
+
+When analysing singletons - we want to exclude those from unrelated individuals...
+This is because some individuals will have VERY few singletons if they have a familial relationship, which biases any estimates.
+
+Use the pops_df and kinship matrix (from aggV2) to make sure we can get an unrelated inds. subset.
+
+Create a "singletons only" lazyframe with those among unrelated individuals excluded...
+```{r}
+## Exclude singeltons in individuals with close familial relatives in the data
+ts_df_sing <- ts_lf_merge %>%
+filter(
+  AC_ts == 1 &
+  singleton_sample_id %in% unrel_pops$sgkit_sample_id
+)
+```
+
+Singletons by pop age summary
+```{r}
+age_by_pca_sing <- ts_df_sing |>
+  group_by(pop) |>
+  summarise(
+    gmean_age = exp(mean(log(mean_time))),
+    mean_age  = mean(mean_time)
+  )
+knitr::kable(age_by_pca_sing)
+```
+
+NFE vs everyone else
+```{r}
+age_by_nfe_vs_all_sing <- ts_df_sing |>
+  mutate(
+    pop_nfe = ifelse(pop == "nfe", pop, "other participants")
+  ) |>
+  group_by(pop_nfe) |>
+  summarise(
+    gmean_age = exp(mean(log(mean_time))),
+    mean_age  = mean(mean_time)
+  )
+knitr::kable(age_by_nfe_vs_all_sing)
+```
+
+eCDF for singletons stratified by predicted ancestry group
+```{r, message = FALSE}
+plot_4b <- ts_df_sing |>
+  dplyr::select(
+    pop, mean_time
+  ) |>
+  as_tibble() |>
+  ecdf_grouped_plot(
+    group_col = "pop",
+    group_vals = as.character(group_numbers$pop),
+    discrete = TRUE
+  ) +
+  labs(
+    x = "Singleton age (generations)",
+    y = "eCDF"
+  ) +
+  theme(legend.position = "NONE") +
+  scale_colour_manual(values = pop_colours_vec)
+```
+
+Looking at the distributions of singleton ages vs appearance in gnomAD by PCA group
+```{r}
+num_quantiles <- 150 # go across 150 quantiles
+fig4c_plot_data <- ts_df_sing |>
+  filter(AC_ts == 1) |>
+  dplyr::select(pop, in_gnomad, mean_time) |>
+  as_tibble() |>
+  mutate(quantile = ntile(log10(mean_time), num_quantiles)) |> 
+  mutate(pop = factor(pop, levels = c(as.character(group_numbers$pop), "nonspecific"))) |>
+  group_by(pop, in_gnomad, quantile) |>
+  summarise(mean_age = log10(median(mean_time, na.rm = TRUE)),
+            n = n()
+  ) |>
+  group_by(pop, quantile) |>
+  mutate(prop = n / sum(n)) |>
+  filter(in_gnomad)
+```
+
+Plot
+```{r}
+plot_4c <- fig4c_plot_data |>
+  ggplot(aes(x = mean_age, y = prop*100, colour = pop, fill = pop, group = pop)) +
+  geom_smooth(linewidth = 0.5, method = "lm", se = FALSE) +
+  geom_point(size = 0.5) +
+  theme_classic(base_size = 20) +
+  theme(
+    legend.position = "NONE"
+  ) +
+  scale_color_manual(values = c(pop_colours_vec, "black")) +
+  scale_fill_manual(values = c(pop_colours_vec, "black")) +
+  coord_cartesian(ylim = c(20, 100), xlim = c(0, 4)) +
+  labs(
+    y = "Observed in gnomADv4.1 (%)",
+    x = "Singleton age (generations)"
+  ) +
+  annotation_logticks(
+    linewidth = 0.5,
+    colour = "grey20",
+    short = unit(0.05, "cm"),
+    mid = unit(0.075, "cm"),
+    long = unit(0.1, "cm"),
+    sides = "b"
+  ) +
+  scale_x_continuous(
+    labels = scales::math_format(10^.x)
+  )
+```
+
+## Number vs age of singletons  
+
+Number of singletons could be a good proxy for relative relatedness to rest of dataset
+That is, if you have more singletons, it's likely that you have fewer close relatives with other people in the dataset. 
+As such, singletons should be on longer branches, and appear older on average than those who have closer genetic ancestors in the dataset
+
+We can thus perform a continuous evaluation vs just looking at the discrete PCA groupings
+
+For example, looking at:
+- Number of singletons vs geometric mean age of the singletons per unrelated individual.
+```{r}
+# Process the data for central plot
+anc_agesd_plot_data <- ts_df_sing |>
+  group_by(singleton_sample_id, pop) |>
+  summarise(
+    number_of_singletons = n(),
+    geometric_mean_age_singletons = exp(mean(log(mean_time))),
+  ) |>
+  distinct() |>
+  as_tibble() |>
+  mutate(pop = factor(pop, levels = group_numbers$pop)) |>
+  arrange(desc(number_of_singletons))
+```
+
+Plot this relationship 
+```{r, fig.height = 7, fig.width = 7}
+corr_plot <- create_joint_density_plot(
+  to_plot = anc_agesd_plot_data,
+  group_numbers = group_numbers,
+  smooth_linewidth = 0.5,
+  include_group_hists = FALSE,
+  cor_size = 5.5,
+  cor_method = "pearson",
+  cor_label_x = 125,
+  cor_label_y = 100,
+  pop_colours_vec = pop_colours_vec
+)
+corr_plot
+```
+
+Test the pearsons's correlation
+```{r}
+test = cor.test(anc_agesd_plot_data$geometric_mean_age_singletons, anc_agesd_plot_data$number_of_singletons, method = "spearman", use = "complete.obs")
+test
+```
+
+Does this correlation hold within PCA groupings as well
+- e.g. continuous relationship within the groups, not just the whole dataset?
+```{r}
+correlation_results <- anc_agesd_plot_data |>
+  group_by(pop) |>
+  group_modify(~{
+    test <- cor.test(.x$geometric_mean_age_singletons, .x$number_of_singletons, method = "spearman", use = "complete.obs")
+    tibble(
+      spearman_r = test$estimate,
+      p_value = test$p.value
+    )
+  }) |>
+  ungroup()
+knitr::kable(correlation_results)
+```
+
+Stratify by PCA group
+```{r, fig.width = 8, fig.height = 8}
+plot_supp_pca_strat <- anc_agesd_plot_data %>%
+  ggplot(aes(
+    x = geometric_mean_age_singletons, y = number_of_singletons, colour = pop
+  )) +
+  theme_classic(base_size = 20) +
+  geom_point(shape = 21) +
+  geom_smooth(method = "lm", linetype = "dotted", se = FALSE, colour = "black") +
+  theme(
+    legend.position = "none",
+    strip.background = element_blank()
+  ) +
+  facet_wrap(~pop) +
+  labs(
+    x = "Geometric mean singleton age (generations)",
+    y = "Number of singletons"
+  ) +
+  scale_colour_manual(values = pop_colours_vec)
+plot_supp_pca_strat
+```
+
+Write to plot data...
+```{r}
+ggsave(paste0(paths$plots_dir, "popstrat_nsingletons_vs_geomean_age.pdf"), plot_supp_pca_strat, height = 8, width = 8)
+```
+
+Are there participants that seem like strong outliers (median absolute deivation > 4, for example)?
+```{r}
+df_mad <- anc_agesd_plot_data %>%
+  group_by(pop) %>%
+  mutate(
+    # robust location & scale (per group)
+    median_singletons = median(number_of_singletons, na.rm = TRUE),
+    mad_singletons    = mad(number_of_singletons, center = median_singletons,
+                            constant = 1.4826, na.rm = TRUE),
+
+    median_age = median(geometric_mean_age_singletons, na.rm = TRUE),
+    mad_age    = mad(geometric_mean_age_singletons, center = median_age,
+                     constant = 1.4826, na.rm = TRUE),
+
+    # MAD z-scores (how many MADs from the group median)
+    zmad_singletons = ifelse(mad_singletons > 0,
+                             (number_of_singletons - median_singletons) / mad_singletons, NA_real_),
+    zmad_age        = ifelse(mad_age > 0,
+                             (geometric_mean_age_singletons - median_age) / mad_age, NA_real_),
+
+    # One-sided “excess” (above the median by > 4 MADs)
+    extreme_excess_singletons = zmad_singletons > 4,
+    extreme_excess_age        = zmad_age > 4
+
+    # If you want two-sided outliers instead, use: abs(zmad_*) > 4
+  ) %>%
+  ungroup()
+
+# Filter individuals that exceed both strict criteria
+df_outliers <- df_mad |>
+  filter(extreme_excess_age)
+```
+
+Summarise numbers of outliers
+```{r}
+# Print counts per population
+df_outliers_summary <- df_outliers |>
+  count(pop) |>
+  rename(pop_outlier_n = n)
+
+outliers_summary_table <- unrel_pops |>
+  group_by(pop) |> tally() |>
+  left_join(df_outliers_summary) |>
+  mutate(prop = pop_outlier_n / n)
+knitr::kable(outliers_summary_table)
+```
+
+Let's take the top 3 from each pop (or max top if < 3 outliers) for more exploration.
+- We will generate psuedo IDs to avoid printing and pulling based on actual GEL platekeys
+```{r}
+top3_by_pop <- df_outliers %>%
+  dplyr::select(singleton_sample_id, pop, zmad_age, number_of_singletons, geometric_mean_age_singletons) %>%
+  filter(!is.na(zmad_age)) %>%
+  group_by(pop) %>%
+  slice_max(order_by = zmad_age, n = 3, with_ties = FALSE) %>%  # top 3 per pop
+  arrange(desc(zmad_age), .by_group = TRUE) %>%
+  mutate(
+    pop_rank  = row_number(),
+    pseudo_id = sprintf("%s%02d", pop, pop_rank)  # e.g. NFE-01, NFE-02, …
+  ) %>%
+  ungroup()
+```
+
+## Age vs frequency along individual haplotypes
+
+Z standardise across frequency
+```{r}
+ts_lf_merge %<>%
+z_normalise(
+      group_col = "AC_ts",
+      score_col = "mean_time",
+      z_col = "time_z",
+      log10 = TRUE
+    )
+```
+
+Z-score along sample haplotypes
+
+We will use our largest and most complete chromosome (chromosome 17) for this!
+```{r, message = FALSE}
+# 0) Make sure checkpoint dir exists
+chk_dir <- file.path(paths$output_dir, "checkpoints")
+dir.create(chk_dir, recursive = TRUE, showWarnings = FALSE)
+
+# 1) Precompute chr17 inputs once
+chr <- "chr17"
+base_df      <- ts_lf_merge %>% filter(chromosome == chr)
+base_ts_list <- trees_list   %>% filter(chromosome == chr)
+```
+
+```{r}
+# 2) Worker for one sample
+process_one_z_haps <- function(id_from_table, pseudo_id) {
+  z_out <- file.path(chk_dir, sprintf("%s-z_score-%s.tsv.gz", chr, pseudo_id))
+  if (file.exists(z_out)) {
+    message("✓ Exists: ", basename(z_out), " — reading cached file.")
+    dt <- data.table::fread(z_out)
+  } else {
+    message("… Computing: ", pseudo_id)
+    dt <- base_df %>%
+      z_along_haps(
+        ts_list       = base_ts_list,
+        ts_dir        = ts_dir,
+        individual_id = id_from_table
+      )
+    data.table::fwrite(dt, z_out, sep = "\t")
+    message("  → Wrote: ", basename(z_out))
+  }
+  # simple, safe column add:
+  dt$pseudo_id <- pseudo_id
+  dt$singleton_sample_id <- id_from_table
+  dt
+}
+
+# 3) Run for all top3 per pop
+res_list <- map2(top3_by_pop$singleton_sample_id, top3_by_pop$pseudo_id, process_one_z_haps)
+example_z_haps_all <- data.table::rbindlist(res_list, use.names = TRUE, fill = TRUE)
+```
+
+GNN along sample haplotypes
+- We need starts + ends of each contig to ensure we separate at the borders
+```{r}
+## ts_start_ends
+ts_start_ends <- ts_lf_merge |>
+  group_by(ts_name) |>
+  summarise(start = min(position), end = max(position)) |>
+  as_tibble()
+
+base_ts_ranges <- ts_start_ends %>% dplyr::filter(grepl(chr, ts_name))
+```
+
+```{r, message = FALSE}
+# 2) Worker for one sample
+process_one_gnn <- function(id_from_table, pseudo_id) {
+  gnn_out <- file.path(chk_dir, sprintf("%s-gnn-%s.tsv.gz", chr, pseudo_id))
+
+  if (file.exists(gnn_out)) {
+    message("✓ Exists: ", basename(gnn_out), " — reading cached file.")
+    dt <- data.table::fread(gnn_out)
+  } else {
+    message("… Computing GNN for ", pseudo_id)
+    dt <- gnn_along_haps(
+      ts_list        = base_ts_list,
+      ts_dir         = ts_dir,
+      ts_suffix      = ts_suffix,
+      pops_df        = pops_no_remaining,
+      starts_ends_df = base_ts_ranges,
+      individual_id  = id_from_table
+    )
+    data.table::fwrite(dt, gnn_out, sep = "\t")
+  }
+
+  # simple, safe column add:
+  dt$pseudo_id <- pseudo_id
+  dt$singleton_sample_id <- id_from_table
+  dt
+}
+
+# 3) Run for all rows in top3_by_pop
+gnn_list <- purrr::map2(
+  .x = top3_by_pop$singleton_sample_id,
+  .y = top3_by_pop$pseudo_id,
+  ~process_one_gnn(id_from_table = .x, pseudo_id = .y)
+)
+
+# Optional: combine
+example_gnn_haps_all <- data.table::rbindlist(gnn_list, use.names = TRUE, fill = TRUE)
+```
+
+Plot frequency controlled age zscore per haplotype among outliers
+```{r, message = FALSE}
+hap1_z_plot_list <- list()
+hap2_z_plot_list <- list()
+for (psuedo in top3_by_pop$pseudo_id) {
+  ## First haplotype
+  hap1_z_plot_list[[psuedo]] <-
+    example_z_haps_all |>
+      filter(pseudo_id == psuedo) |>
+      mutate(time_z = ifelse(time_z > 5, 5, time_z)) |>
+      adac_along_haps_plot(
+        adac_col = "time_z",
+        AC_thresh = ur_ac_count,
+        AC_highlight = c(1:ur_ac_count),
+        haplotype_number = "Haplotype 1",
+        remove_x_axis = TRUE,
+        rolling_average_nmutations = 10
+      ) +
+      coord_cartesian(
+        ylim = c(-5, 5),
+        xlim = c(min(example_gnn_haps_all$start)/1000000, max(example_gnn_haps_all$end)/1000000)
+      ) +
+      scale_y_continuous(breaks = c(-4, 0, 4))
+  ## Second haplotype
+  hap2_z_plot_list[[psuedo]] <-
+    example_z_haps_all |>
+      filter(pseudo_id == psuedo) |>
+      mutate(time_z = ifelse(time_z > 5, 5, time_z)) |>
+      adac_along_haps_plot(
+        adac_col = "time_z",
+        AC_thresh = ur_ac_count,
+        AC_highlight = c(1:ur_ac_count),
+        haplotype_number = "Haplotype 2",
+        remove_x_axis = TRUE,
+        rolling_average_nmutations = 10
+      ) +
+      coord_cartesian(
+        ylim = c(-5, 5),
+        xlim = c(min(example_gnn_haps_all$start)/1000000, max(example_gnn_haps_all$end)/1000000)
+      ) +
+      scale_y_continuous(breaks = c(-4, 0, 4))
+}
+```
+
+Same for GNN
+```{r}
+hap1_gnn_plot_list <- list()
+hap2_gnn_plot_list <- list()
+for (psuedo in top3_by_pop$pseudo_id) {
+  hap1_gnn_plot_list[[psuedo]] <- example_gnn_haps_all |>
+    filter(pseudo_id == psuedo) |>
+    gnn_along_haps_plot(
+      pop_vec = group_numbers$pop[!group_numbers$pop == "remaining"],
+      haplotype_number = 2, # reversed due to mistake
+      remove_x_axis = TRUE
+    ) +
+    scale_colour_manual(values = pop_colours_vec[!group_numbers$pop == "remaining"]) +
+    scale_fill_manual(values = pop_colours_vec[!group_numbers$pop == "remaining"])
+  
+  hap2_gnn_plot_list[[psuedo]] <- example_gnn_haps_all |>
+    filter(pseudo_id == psuedo) |>
+    gnn_along_haps_plot(
+      pop_vec = group_numbers$pop[!group_numbers$pop == "remaining"],
+      haplotype_number = 1,
+      remove_x_axis = TRUE
+    ) +
+    scale_colour_manual(values = pop_colours_vec[!group_numbers$pop == "remaining"]) +
+    scale_fill_manual(values = pop_colours_vec[!group_numbers$pop == "remaining"])
+}
+```
+
+Combine these plots...
+```{r, message = FALSE}
+## same for everyone
+x_axis_plot <- 
+  x_pos_only_plot(example_z_haps_all |> filter(pseudo_id == "nfe03"))
+comb_hap_plot_list <- list()
+for (psuedo in top3_by_pop$pseudo_id) {
+  comb_hap_plot_list[[psuedo]] <-
+    stitch_haps_plot(
+      sample_name = psuedo,
+      hap1_gnn_plot_list[[psuedo]],
+      hap2_gnn_plot_list[[psuedo]],
+      hap1_z_plot_list[[psuedo]],
+      hap2_z_plot_list[[psuedo]],
+      x_axis_plot
+    )
+}
+```
+
+```{r}
+plots <- lapply(comb_hap_plot_list, function(p) {
+  p + theme(plot.margin = margin(10, 10, 20, 10)) # top, right, bottom, left in pts
+})
+chunks <- split(plots, ceiling(seq_along(plots) / 4))
+
+pages <- lapply(chunks, function(x) {
+  x <- c(x, rep(list(NULL), 4 - length(x)))
+  n_labs <- sum(!vapply(x, is.null, logical(1)))
+  ggarrange(plotlist = x, labels = letters[1:n_labs], ncol = 2, nrow = 2, align = "hv")
+})
+
+filenames <- sprintf(paste0(paths$plots_dir, "age_z_gnn_plot%02d.pdf"), seq_along(pages))
+mapply(function(p, f) ggsave(filename = f, plot = p, width = 19, height = 13), pages, filenames)
+```
+
+Take a look at them...
+```{r, fig.width=19, fig.height=13}
+pages[[1]]
+```
+
+```{r, fig.width=19, fig.height=13}
+pages[[2]]
+```
+
+```{r, fig.width=19, fig.height=13}
+pages[[3]]
+```
+
+```{r, fig.width=19, fig.height=13}
+pages[[4]]
+```
+
+Looks like the high Z scores, indicating older ages than expected given frequency, track regions of differentiated ancestries.
+Particularly African ancestries - however, even notable variation within "African ancestries"
+
+## AF information from external datasets
+
+Lets see if AF information from external datasets can add more context.
+```{r, message = FALSE}
+## Column names
+column_names <- names(read_tsv(file.path(paste0(paths$output_dir, "all-chr17-df.tsv.gz")), n_max = 1))
+selected_columns <- column_names[
+  grepl("position|gnomad_genomes|ga100k_genomes", column_names)
+]
+
+pop_acs <- read_tsv(
+  paste0(paths$output_dir, "all-chr17-df.tsv.gz"),
+  col_select = all_of(selected_columns)
+)
+```
+
+Subset
+- We'll use nfe03 as an indicative example
+```{r}
+plot_4e <- comb_hap_plot_list[["nfe03"]]
+```
+
+```{r}
+example_z_haps <- example_z_haps_all %>%
+  filter(pseudo_id == "nfe03")
+pops_acs_ext <- pop_acs |>
+  filter(position %in% example_z_haps$position)
+```
+
+Plotting functions for external AF heatmaps
+```{r}
+plot_4f <- generate_af_heatmap_plots(
+  adac_haps = example_z_haps,
+  pop_acs_ext = pops_acs_ext,
+  ts_df = ts_lf_merge %>%
+    filter(chromosome == "chr17") %>%
+    as_tibble(),
+  AC_thresh = ur_ac_count,
+  thresholds = c(4, 3, 2, 1, 0, -1),
+  haplotypes_vec = c("Haplotype 1", "Haplotype 2"),
+  datasets_vec = c("gnomad", "ga100k"),
+  AF_col = "AF_log", label = "DAF",
+  datasets_full_names_vec = c("gnomADv4.1", "GA100k")
+)
+```
+
+Combine with the GNN/Z plot
+```{r, fig.width=15.25, fig.height=6.5}
+bottom <- ggarrange(
+  NULL,
+  ggarrange(plot_4e, NULL, ncol = 1, heights = c(1, 0.06)),
+  NULL,
+  ggarrange(
+    plot_grid(
+    NULL,
+    ggdraw() +
+      draw_label(
+        "nfe03", 
+        x = 0.1, 
+        y = 0.5, 
+        hjust = 0, 
+        size = 20
+      ),
+    NULL,
+    ggdraw() +
+      draw_label(
+        "GEL DAF <0.1%", 
+        x = 0.1, 
+        y = 0.5, 
+        hjust = 0, 
+        size = 16
+      ),
+    nrow = 1,
+    rel_widths = c(0.13, 0.1, 0.15, 0.5), # Adjust as needed for spacing
+    align = "hv"
+  ),
+  plot_4f, ncol = 1, heights = c(0.075, 1)),
+  nrow = 1,
+  widths = c(0.01, 1, 0.05, 0.5)
+)
+bottom
+```
+
+Highlight the relevant individual on the singleton vs singleton age plot...
+```{r}
+ss_id <- top3_by_pop %>%
+  filter(pseudo_id == "nfe03") %>%
+  pull(singleton_sample_id)
+plot4_d <- create_joint_density_plot(
+  to_plot = anc_agesd_plot_data,
+  highlight_id = ss_id,
+  sample_name  = "nfe03",
+  group_numbers = group_numbers,
+  smooth_linewidth = 0.5,
+  include_group_hists = FALSE,
+  cor_size = 5.5,
+  cor_method = "pearson",
+  cor_label_x = 125,
+  cor_label_y = 100,
+  pop_colours_vec = pop_colours_vec
+)
+```
+
+Arrange top...
+- Main figure 4 for paper...
+```{r}
+top <- ggarrange(
+  plot_4_legend,
+  NULL,
+  ggarrange(
+    ggarrange(
+      plot_4a,
+      NULL,
+      ggarrange(
+        plot_4b,
+        plot_4c,
+        ncol = 1,
+        align = 'v',
+        heights = c(0.5, 1)
+      ),
+      nrow = 1,
+      widths = c(0.315, 0.05, 1)
+    ),
+    NULL,
+    ggarrange(plot4_d, NULL, ncol = 1, heights = c(1, 0.015)),
+    nrow = 1,
+    widths = c(1.15, 0.05, 1, 0.01)
+  ),
+  ncol = 1,
+  heights = c(0.1, 0.05, 1)
+)
+```
+
+Arrange complete Figure
+```{r, fig.width = 15.25, fig.height = 13}
+fig4_plot <- ggarrange(
+  ggarrange(top, NULL, widths = c(1, 0.075)),
+  NULL,
+  bottom,
+  ncol = 1,
+  heights = c(1, 0.04, 0.8)
+)
+```
+
+Make PDF
+```{r}
+ggsave(paste0(paths$plots_dir, "tmp_main_figure_ancestry_to_edit.pdf"), width = 15.25, height = 13)
+```
+
+## Oceania regression 
+Variants in the example individual nfe03 seem to have relationship between frequency controlled age-zscore and frequency in Oceania.
+- Are Common OCE mutations enriched among age-frequency Z score outliers (Z > 4) across the whole dataset?
+```{r}
+oce_logistic_test_z <-
+outlier_logistic_loop_wrapper(
+  df = ts_lf_merge %>%
+    dplyr::select(AC_oce_ga100k_genomes, AN_oce_ga100k_genomes, time_z, chromosome, position, AC_ts) %>%
+    as_tibble() %>%
+    mutate(
+      common_oce = ifelse(
+        (AC_oce_ga100k_genomes / AN_oce_ga100k_genomes) > 0.01,
+        "yes", "no"
+      ),
+      common_oce = ifelse(is.na(common_oce), "no", common_oce)
+    ),
+  outcome_col = "common_oce",
+  outcome_vec = c("yes"),
+  outlier_thresh_vec = c(4, Inf),
+  outlier_col = "time_z",
+  group_vals = c(1:ur_ac_count),
+  direction = "between",
+  correct_groups = FALSE,
+  group_as_factor = FALSE
+)
+```
+
+Tabulate the regression statistics
+```{r}
+## exponetiate to get non log values
+ocea_test_out <- oce_logistic_test_z %>%
+  mutate(
+    enrich    = exp(estimate),
+    conf_high = exp(conf.high),
+    conf_low  = exp(conf.low)
+  ) %>%
+  dplyr::select(
+    c(enrich, conf_high, conf_low, std.error, p.value)
+  )
+knitr::kable(ocea_test_out, bookends = FALSE)
+```

@@ -1,0 +1,1560 @@
+---
+title: "GEL - Summary statistics from annotated dataframes"
+author: Sam Tallman
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+    toc_collapsed: true
+    toc_depth: 2
+    number_sections: true
+    code_folding: hide
+params:
+    ts_tsv: "trees_singletons_july25.tsv"
+---
+
+# Packages
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+```{r, message = FALSE}
+library(tidyverse)
+library(data.table)
+library(MASS)
+library(magrittr)
+library(viridis)
+library(broom)
+library(Rcpp)
+library(cowplot)
+library(ggpubr)
+library(zoo)
+library(reticulate)
+library(polars)
+library(tidypolars)
+library(glue)
+library(scales)
+library(purrr)
+library(rtracklayer)
+library(GenomicRanges)
+
+## conda environment.
+use_virtualenv("/opt/python_env", required = TRUE)
+```
+
+# Parameters
+
+```{r, message = FALSE}
+## Python functions for reticulate
+source_python("functions/gel-funcs.py")
+
+## Source R functions
+source("functions/gel-funcs.R")
+source("functions/gel-plotting_funcs.R")
+```
+
+File paths from config...
+```{r}
+config <- yaml::read_yaml("config/config.yaml")
+
+# Fill templates
+paths <- lapply(config$paths, function(path) {
+  if (grepl("\\{chrom\\}|\\{chrom_no_prefix\\}", path)) {
+    return(NULL)   # skip chrom-templated paths
+  }
+  glue(path,
+       data_dir       = config$paths$data_dir,
+       singletons_dir = config$paths$singletons_dir
+  )
+})
+
+paths <- Filter(Negate(is.null), paths)
+```
+
+Total individuals
+- Total individuals, total unrelated individuals < 3rd degree
+
+```{r}
+pops_df <- read_tsv(paths$pops_path)
+## Unrelated pops
+unrel_pops_df <- pops_df |>
+unrelated_filter(
+  sample_col = "sgkit_sample_id",
+  aggV2_kinship_matrix = paths$aggV2_kinship_matrix,
+  kinship_coefficient = 0.0442
+)
+```
+
+```{r}
+## List of trees (with singletons included)
+ts_tsv = params$ts_tsv
+# ts_tsv = "/pgen_int_work/BRS/dd/sam/projects/gel-dating-paper/trees_singletons_july25.tsv"
+trees_list <- read_tsv(ts_tsv)
+ts_dir <- paths$ts_dir
+```
+
+# Data
+
+We read in the relevant data from chromosomes
+```{r, message = FALSE}
+# Extract relevant columns from the ts_df for chromosome 17
+selected_columns <- c(
+    "chromosome",
+    "position",
+    "ancestral_state",
+    "derived_state",
+    "ts_name",
+    "AC_ts",
+    "AF_ts",
+    "consequence",
+    "cpg_transition",
+    "shape_time",
+    "scale_time",
+    "upper_conf_time",
+    "lower_conf_time",
+    "sd_time",
+    "cv_time",
+    "in_gnomad",
+    "mean_time",
+    "mutation_root_parent",
+    "pop",
+    "singleton_sample_id"
+  )
+```
+
+Lazy loading for filtering etc.
+Combine the ts_df (parquet) from gel-ts_df.Rmd (all chromosomes)
+```{r}
+ts_lf_merge <- scan_parquet_polars(file.path(paths$output_dir, "all-chr*-df.parquet")) |>
+  dplyr::select(all_of(selected_columns))  |>
+  compute()
+```
+
+Add edge spans
+```{r, message = FALSE}
+edge_span_list <- list()
+ts_names_vec <- unique(ts_lf_merge |> pull(ts_name))
+
+for (index in 1:length(ts_names_vec)) {
+  tree <- trees_list |>
+    filter(grepl(ts_names_vec[index], ts_prefix))
+  edge_file <- paste0(
+    paths$output_dir,
+    "checkpoints/all-",
+    ts_names_vec[index],
+    "-edge_spans.tsv.gz"
+  )
+  if (file.exists(edge_file )) {
+    print(tree$chromosome)
+    edge_span_list[[index]] <- read_tsv(edge_file) |>
+      mutate(chromosome = tree$chromosome)
+  } else {
+    ts_name_now <- ts_names_vec[index]
+    var_df <- ts_lf_merge |>
+      filter(ts_name == ts_name_now) |>
+      as_tibble()
+    edge_df  <- edge_span_mutations(
+      ts_path = paste0(ts_dir, tree$ts_prefix, ".trees.tsz"),
+      positions = var_df$position
+    ) |>
+      mutate(chromosome = tree$chromosome)
+    edge_df |>
+      fwrite(
+        file.path(edge_file), sep = "\t"
+      )
+     edge_span_list[[index]] <- edge_df
+  }
+}
+```
+
+Join with the lazy frame
+```{r}
+edges_df <- do.call(rbind, edge_span_list) |>
+mutate(
+  edge_span_kb = (edge_right - edge_left) / 1000
+)
+edges_lf <- as_polars_lf(edges_df) |>
+  compute()
+
+ts_lf_merge %<>%
+left_join(
+  edges_lf, by = c("chromosome", "position")
+)
+```
+
+# Simple summary statistics
+
+How many total individuals?
+```{r}
+n_inds <- nrow(pops_df)
+
+cat(
+  "There are", n_inds, "total individuals in the tree sequences.\n" 
+)
+```
+
+How many total unrelated individuals?
+```{r}
+n_unrel_inds <- nrow(unrel_pops_df)
+
+cat(
+  "There are", n_unrel_inds, "in the tree sequence without any < 3rd degree relatives.\n" 
+)
+```
+
+How many different contigs used for inference / dating?
+```{r}
+n_total_contigs <- ts_lf_merge |>
+  pull(ts_name) |>
+  unique() |>
+  length()
+
+cat(
+  "There are", n_total_contigs, "distinct chromosomal segments used for dating / inference.\n" 
+)
+```
+
+Number of total mutations across all chromosomes
+```{r}
+# variable sites
+n_total_sites <- nrow(ts_lf_merge)
+cat(
+  "There are", n_total_sites, "variants across all tree sequences.\n" 
+)
+```
+
+How many have dates?
+```{r}
+# variable sites
+n_sites_w_dates <- nrow(ts_lf_merge |> drop_na(mean_time))
+
+cat(
+  "There are", n_total_sites - n_sites_w_dates , "variants without associated dates\n" 
+)
+```
+
+How many singletons were appended to terminal branches?
+```{r}
+n_singletons_total <- nrow(ts_lf_merge |> filter(AC_ts == 1))
+
+cat(
+  "There are", n_singletons_total, "singleton variants (DAC = 1) across all tree sequences\n" 
+)
+```
+
+How many singletons among unrelated individuals (used for singleton analyses)
+```{r}
+n_singletons_unrel <- nrow(ts_lf_merge |> filter(AC_ts == 1 & singleton_sample_id %in% unrel_pops_df$sgkit_sample_id))
+
+cat(
+  "There are", n_singletons_unrel, "singleton variants (DAC = 1) among the unrelated participants in the tree sequences\n" 
+)
+```
+
+Edges + ancestral nodes
+```{r}
+## Number of ancestors / edges
+ts_names_vec <- unique(ts_lf_merge |> pull(ts_name))
+n_ancestors <- 0
+n_edges <- 0
+for (index in 1:length(ts_names_vec)) {
+  tree <- trees_list |>
+    filter(grepl(ts_names_vec[index], ts_prefix))
+  n_ancestors_tree <- no_ancestors(
+      ts_path = paste0(ts_dir, tree$ts_prefix, ".trees.tsz")
+  )
+  n_ancestors <- n_ancestors + n_ancestors_tree
+  n_edges_tree <- no_edges(
+      ts_path = paste0(ts_dir, tree$ts_prefix, ".trees.tsz")
+  )
+  n_edges <- n_edges + n_edges_tree
+}
+```
+
+How many edges across all tree sequences?
+```{r}
+cat(
+  "There are", n_edges , "edges across all tree sequences\n" 
+)
+```
+
+How many ancestral nodes across all tree sequences?
+```{r}
+cat(
+  "There are", n_ancestors , "ancestral nodes across all tree sequences\n" 
+)
+```
+
+How many mutations whose parents are root nodes?
+- These are excluded from all downstream analyses ...
+```{r}
+n_mutation_root <- ts_lf_merge |>
+  filter(
+    mutation_root_parent
+  ) |>
+  nrow()
+
+cat(
+  "There are", n_mutation_root , "mutations whose parents are unconstrained root nodes in the tree sequences\n" 
+)
+```
+
+How many sites are unobserved in the gnomADv4.1 reference database?
+```{r}
+# variable sites
+n_in_gnomad_sites <- nrow(ts_lf_merge |> filter(in_gnomad))
+
+cat(
+  "There are", n_total_sites - n_in_gnomad_sites , "mutations in the tree sequences unobserved in gnomADv4.1\n" 
+)
+```
+
+Tabulate simple statistics
+```{r}
+# Fallbacks to avoid errors if some optional objects aren't present
+val_or_na <- function(x) if (exists(x, inherits = TRUE)) get(x) else NA_integer_
+
+n_edges_val     <- val_or_na("n_edges")
+n_ancestors_val <- val_or_na("n_ancestors")
+
+# Derived from your existing counts
+n_sites_wo_dates <- n_total_sites - n_sites_w_dates
+n_not_in_gnomad  <- n_total_sites - n_in_gnomad_sites
+
+summary_tbl <- tibble(
+  Metric = c(
+    "Individuals (total)",
+    "Individuals (unrelated; no <3rd-degree)",
+    "Chromosomal segments used",
+    "Variants (total)",
+    "Variants with dates",
+    "Variants without dates",
+    "Singleton variants (DAC = 1)",
+    "Singletons among unrelated participants",
+    "Edges across all tree sequences",
+    "Ancestral nodes across all tree sequences",
+    "Mutations with unconstrained-root parents",
+    "Mutations unobserved in gnomAD v4.1"
+  ),
+  Value = c(
+    n_inds,
+    n_unrel_inds,
+    n_total_contigs,
+    n_total_sites,
+    n_sites_w_dates,
+    n_sites_wo_dates,
+    n_singletons_total,
+    n_singletons_unrel,
+    n_edges,
+    n_ancestors,
+    n_mutation_root,
+    n_not_in_gnomad
+  ),
+  `% of total variants` = c(
+    NA,
+    NA,
+    NA,
+    100,
+    100 * n_sites_w_dates    / n_total_sites,
+    100 * n_sites_wo_dates   / n_total_sites,
+    100 * n_singletons_total / n_total_sites,
+    100 * n_singletons_unrel / n_total_sites,
+    NA,
+    NA,
+    100 * n_mutation_root    / n_total_sites,
+    100 * n_not_in_gnomad    / n_total_sites
+  )
+) |>
+  mutate(
+    Value = comma(Value),
+    `% of total variants` = ifelse(
+      is.na(`% of total variants`), "",
+      percent(`% of total variants` / 100, accuracy = 0.1)
+    )
+  )
+
+knitr::kable(summary_tbl, align = c("l","r","r"), caption = "Dataset summary")
+```
+
+# Allele ages stats and tables
+
+Mean allele age
+```{r}
+mean_age_all <- mean(ts_lf_merge |> filter(mutation_root_parent == FALSE) |> pull(mean_time), na.rm = TRUE)
+
+cat(
+  "The mean mutation age across all sites is", mean_age_all, " generations\n" 
+)
+```
+
+Geometric mean allele age
+```{r}
+geo_mean_age_all <- exp(mean(log(ts_lf_merge |> filter(mutation_root_parent == FALSE) |> pull(mean_time)), na.rm = TRUE))
+
+cat(
+  "The geometric mean mutation age across all sites is", geo_mean_age_all, " generations\n" 
+)
+```
+
+Simple number of mutations by allele age epoch
+```{r}
+# Add epochs
+ts_lf_merge %<>%
+  drop_na(mean_time) %>%
+  mutate(
+    epoch = case_when(
+      mean_time <= 10                  ~ "≤10",
+      mean_time > 10   & mean_time <= 100    ~ "11-100",
+      mean_time > 100  & mean_time <= 1000  ~ "101-1,000",
+      mean_time > 1000 & mean_time <= 10000 ~ "1,001-10,000",
+      mean_time > 10000                      ~ ">10,000"
+    )
+  )
+
+# Youngest to oldest
+order_epoch_bins <-
+  c(
+    "≤10",
+    "11-100",
+    "101-1,000",
+    "1,001-10,000",
+    ">10,000"
+  )
+```
+
+How many mutations per epoch?
+```{r}
+epoch_counts <- ts_lf_merge |>
+  filter(mutation_root_parent == FALSE) |>
+  group_by(epoch) |>
+  summarise(
+    n_mutations = n()
+  ) |>
+  as_tibble() |>
+  mutate(
+    epoch = factor(epoch, levels = order_epoch_bins)
+  ) |>
+  arrange(epoch) |>
+  ungroup() |>
+  mutate(
+    percentage_of_total = round(100 * (n_mutations / sum(n_mutations)), 1)
+  )
+
+knitr::kable(epoch_counts, bookends = FALSE)
+```
+
+As bar plot
+```{r, fig.width=7, fig.height=4}
+epoch_ages_bar <- epoch_counts |>
+  ggplot(aes(
+    x = epoch, y = n_mutations / 1000000
+  )) +
+  geom_bar(stat = "identity", fill = "#005eb8", colour = "black", width = 0.65) +
+  theme_minimal(base_size = 20) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "NONE",
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  ) +
+  geom_text(
+    aes(label = paste0(round(percentage_of_total, 2), "%"), vjust = -0.5, size = 5)
+  ) +
+  labs(
+    x = "Allele age epoch (generations ago)",
+    y = "Mutations (millions)"
+  ) +
+  scale_y_continuous(limits = c(0, 14.5))
+epoch_ages_bar
+```
+
+```{r}
+ggsave(paste0(paths$plots_dir, "epoch_ages_bar.pdf"), epoch_ages_bar, width = 7, height = 4)
+```
+
+Cumulative % mutations at given age
+- ECDF is heavy, use 0.01 percentile bins / 0.1 deciles
+```{r}
+# (deciles = 0.1, percentiles = 0.01)
+probs <- seq(0.01, 0.99, by = 0.01)
+x <- ts_lf_merge |>
+  filter(mutation_root_parent == FALSE) |>
+  dplyr::pull(mean_time)
+x <- x[is.finite(x) & x > 0]
+qs  <- unname(quantile(x, probs, na.rm = TRUE, names = FALSE))
+qdf <- tibble(p = probs, x = qs)
+```
+
+Plot
+```{r, fig.width = 7, fig.height = 7}
+cum_prop_ages <- ggplot(qdf, aes(x = x, y = 100*p)) +
+  geom_point(size = 2, shape = 21, colour = "#005eb8") +
+  scale_x_log10(
+    breaks = trans_breaks("log10", function(z) 10^z),
+    labels = trans_format("log10", math_format(10^.x))
+  ) +
+  scale_y_continuous(labels = label_percent(scale = 1)) +
+  labs(x = "Allele age (generations ago)",
+       y = "Cumulative % of variants") +
+  theme_classic(base_size = 20) +
+  annotation_logticks(
+        linewidth = 0.5,
+        colour = "grey20",
+        short = unit(0.05, "cm"),
+        mid = unit(0.075, "cm"),
+        long = unit(0.1, "cm"),
+        sides = "b"
+      )
+cum_prop_ages
+```
+
+```{r}
+ggsave(paste0(paths$plots_dir, "cumul_prop_ages.pdf"), cum_prop_ages, width = 7, height = 7)
+```
+
+Majority of variants occurred in last ~80 generations
+- With 30 years per gen, last ~2,400 years.
+
+#### Summarise allele ages by frequency
+
+Full derived AFS
+```{r}
+derived_afs <- ts_lf_merge |>
+  group_by(
+    AF_ts
+  ) |>
+  summarise(
+    n = n()
+  ) |>
+  as_tibble() |>
+  ungroup() |>
+  mutate(
+    prop = n / sum(n)
+  )
+```
+
+Plot
+
+```{r, fig.width = 7, fig.height = 5.25}
+derived_afs_plot <- derived_afs |>
+  ggplot(aes(x = AF_ts, y = prop)) +
+  geom_point(shape = 21, colour = "#005eb8") +
+  scale_y_log10() +
+  theme_classic(base_size = 20) +
+  scale_y_log10(
+    breaks = trans_breaks("log10", function(x) 10^x),
+    labels = label_percent(accuracy = 0.0001)
+  ) +
+  labs(
+    y = "% of variants",
+    x = "Derived allele frequency (DAF)"
+  )
+derived_afs_plot
+```
+
+```{r}
+ggsave(paste0(paths$plots_dir, "gel_derived_afs.pdf"), derived_afs_plot, width = 7, height = 5.25)
+```
+
+Age vs frequency overall plot
+- Equivalent to simulation of freq vs age
+
+```{r, fig.width = 7, fig.height = 7}
+mean_age_vs_freq_plot <- hex_scatter(
+  ts_lf_merge |>
+    filter(mutation_root_parent == FALSE),
+  x = mean_time, y = AF_ts,
+  xlab = "Allele age (generations ago)",
+  ylab = "Derived allele frequency (DAF)",
+  log_x = TRUE, log_y = TRUE,
+  bins = 100,
+  show_cor = TRUE, cor_method = "spearman",
+  cor_label_x = -0.6, cor_label_y = -0.5,
+  cor_coords = "log10",
+  cor_size = 5
+)
+mean_age_vs_freq_plot
+```
+
+```{r}
+ggsave(paste0(paths$plots_dir, "mean_age_vs_freq.pdf"), mean_age_vs_freq_plot, width = 7, height = 7)
+```
+
+Frequency bins
+```{r}
+ts_lf_merge %<>%
+  mutate(
+    frequency_bin = case_when(
+      AC_ts == 1     ~ "Singletons",
+      AC_ts > 1 & AF_ts <= 0.0001 ~ "< 0.0001\n(non-singleton)",
+      AF_ts > 0.0001 & AF_ts <= 0.001  ~ "0.0001 - 0.001",
+      AF_ts > 0.001 & AF_ts <= 0.01  ~ "0.001 - 0.01",
+      AF_ts > 0.01 & AF_ts <= 0.1  ~ "0.01 - 0.1",
+      AF_ts > 0.1 ~ "> 0.1"
+    )
+  )
+
+order_freq_bins <-
+  c(
+    "Singletons",
+    "< 0.0001\n(non-singleton)",
+    "0.0001 - 0.001",
+    "0.001 - 0.01",
+    "0.01 - 0.1",
+    "> 0.1"
+  )
+```
+
+Tabulate statistics
+```{r}
+# Excluding mutations whose parents are unconstrained roots.
+stats_per_freq_bin <- ts_lf_merge |>
+  filter(mutation_root_parent == FALSE) |>
+  group_by(frequency_bin) |>
+  summarise(
+    n_mutations         = n(),
+    mean_age   = mean(mean_time, na.rm = TRUE),
+    gm_age = exp(mean(log(mean_time), na.rm = TRUE)),
+    median_age  = median(mean_time, na.rm = TRUE)
+  ) |>
+  as_tibble() |>
+  mutate(
+    frequency_bin = factor(frequency_bin, levels = order_freq_bins),
+    percentage_of_total = 100 * (n_mutations / sum(n_mutations))
+  ) |>
+  arrange(frequency_bin)
+knitr::kable(stats_per_freq_bin, bookends = FALSE)
+```
+
+As bar plot of mutation counts
+```{r}
+plot_freq_bar <- stats_per_freq_bin |>
+  ggplot(aes(
+    x = frequency_bin, y = n_mutations / 1000000
+  )) +
+  geom_bar(stat = "identity", fill = "#005eb8", colour = "black", width = 0.65) +
+  theme_minimal(base_size = 20) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "NONE",
+    axis.text.x = element_text(size = 0.1, colour = "white")
+  ) +
+  geom_text(
+    aes(label = paste0(round(percentage_of_total, 2), "%"), vjust = -0.5, size = 5)
+  ) +
+  labs(
+    x = "",
+    y = "Mutations (millions)",
+    title = "GEL tree sequence"
+  ) +
+  scale_y_continuous(limits = c(0, 14.5))
+```
+
+As violin plot
+```{r}
+freq_bin_df <- ts_lf_merge |>
+  filter(mutation_root_parent == FALSE) |>
+  dplyr::select(
+    mean_time, frequency_bin
+  ) |>
+  as_tibble() |>
+  mutate(frequency_bin = factor(frequency_bin, levels = order_freq_bins))
+```
+
+```{r}
+plot_freq_violin <- freq_bin_df |>
+  ggplot(aes(x = frequency_bin, y = mean_time)) +
+  geom_violin(fill = "#005eb8", colour = "black") +
+  geom_point(data = stats_per_freq_bin, aes(y = gm_age),
+             shape = 23, size = 5, fill = "black", colour = "black", stroke = 0.6) +
+  geom_text(data = stats_per_freq_bin,
+            aes(y = gm_age, label = label_comma(accuracy = 1)(gm_age)),
+            size = 5, colour = "black", vjust = 2.1) +
+  scale_y_log10(
+    breaks = trans_breaks("log10", function(x) 10^x),
+    labels = trans_format("log10", math_format(10^.x))
+  ) +
+  annotation_logticks(sides = "l",
+                      linewidth = 0.5, colour = "grey20",
+                      short = unit(0.05, "cm"),
+                      mid   = unit(0.075, "cm"),
+                      long  = unit(0.1, "cm")) +
+  theme_minimal(base_size = 20) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  ) +
+  labs(x = "Derived allele frequency bin",
+       y = "Allele age (generations ago)")
+```
+
+Combine the two
+```{r, fig.width = 8, fig.height = 9}
+plot_freq_comb<- plot_grid(
+  plot_freq_bar,
+  plot_freq_violin,
+  align = "v",
+  ncol = 1,
+  labels = c("a", "b"),
+  rel_heights = c(0.5, 1)
+)
+plot_freq_comb
+```
+
+```{r}
+ggsave(paste0(paths$plots_dir, "freq_comb_barviolin.pdf"), plot_freq_comb, width = 8, height = 9)
+```
+
+#### Summarise allele ages by contigs
+
+Total independent trees + there start and end positions along chromosomes
+```{r}
+stats_per_contig <- ts_lf_merge |>
+  as_tibble() |>
+  group_by(ts_name) |>
+  summarise(
+    chromosome = min(chromosome),
+    start_position = min(position),
+    end_position   = max(position),
+    n_mutations = n(),
+    mean_age   = mean(mean_time, na.rm = TRUE),
+    sd_age      = sd(mean_time, na.rm = TRUE),
+    gmean_age = exp(mean(log(mean_time), na.rm = TRUE)),
+    median_age  = median(mean_time, na.rm = TRUE)
+  ) |>
+  mutate(
+    contig_size_mb    = (end_position - start_position) / 1000000
+  ) |>
+  arrange(ts_name) |>
+  as_tibble()
+
+knitr::kable(stats_per_contig, bookends = FALSE)
+```
+
+#### Genomic representativeness of contigs
+
+We want to compare our contigs to genome in terms of:
+- Genic fractions  
+- Recombination rates  
+
+Inference regions CSV
+```{r}
+inference_regions <- read_csv("../data/inference_regions.csv")
+```
+
+Regions
+```{r}
+regions_table <- stats_per_contig %>%
+  dplyr::select(ts_name, chromosome, start_position, end_position)
+regions_gr <- with(regions_table,
+  GRanges(
+    seqnames = chromosome,
+    ranges   = IRanges(start = start_position, end = end_position)
+  )
+)
+region_lengths <- width(regions_gr) 
+```
+
+Read in the ensembl gene layers (genome-wide)
+```{r}
+ensembl_genes <- readGFF(paths$genes_ensembl) %>%
+  mutate(chromosome = paste0("chr", seqid))
+```
+
+```{r}
+autosomes <- paste0("chr", seq(1:22))
+genes_gr <- ensembl_genes %>%
+  filter(type == "gene", gene_biotype == "protein_coding") %>%
+  transmute(
+    seqnames = chromosome,
+    start    = start,
+    end      = end
+  ) %>%
+  distinct() %>%   # just in case of duplicates
+  { GRanges(seqnames = .$seqnames, ranges = IRanges(start = .$start, end = .$end)) }
+genes_union <- reduce(genes_gr)
+genes_union <- keepSeqlevels(genes_gr,        autosomes, pruning.mode = "coarse")
+genes_cov <- coverage(genes_union)
+```
+
+Functions for extracting or summarising genic proportions
+```{r}
+prop_bases_in_genes <- function(regions_gr, feature_gr) {
+  regions_union <- reduce(regions_gr)
+  ov <- intersect(regions_union, feature_gr)
+  sum(width(ov)) / sum(width(regions_union))
+}
+
+prop_bases_in_genes_summary <- function(regions_gr, feature_cov) {
+
+  chroms <- as.character(seqnames(regions_gr))
+  starts <- start(regions_gr)
+  ends   <- end(regions_gr)
+  len_bp <- ends - starts + 1L
+
+  n <- length(chroms)
+  feature_bp <- numeric(n)
+
+  # For each region, sum coverage over that interval
+  for (i in seq_len(n)) {
+    cov_chr <- feature_cov[[chroms[i]]]
+    if (is.null(cov_chr)) {
+      feature_bp[i] <- 0
+    } else {
+      v <- Views(cov_chr, starts[i], ends[i])
+      feature_bp[i] <- sum(viewSums(v))
+    }
+  }
+
+  prop_region <- round(feature_bp / len_bp, 3)
+
+  total_feature_bp <- sum(feature_bp)
+  total_bp         <- sum(len_bp)
+  overall_prop     <- total_feature_bp / total_bp
+
+  per_region <- tibble::tibble(
+    chromosome        = chroms,
+    start_position        = starts,
+    end_position          = ends,
+    len_bp       = len_bp,
+    feature_bp   = feature_bp,
+    prop_feature = prop_region
+  )
+
+  list(
+    total_feature_bp = total_feature_bp,
+    total_bp         = total_bp,
+    overall_prop     = overall_prop,
+    per_region       = per_region
+  )
+}
+```
+
+Summarise for the data
+```{r}
+gene_summary_obs <- prop_bases_in_genes_summary(regions_gr, genes_cov)
+gene_summary_obs
+```
+
+HapMap recombination rates (genome-wide)
+```{r, message = FALSE}
+hapmap_rates_list <- list()
+for (chrom in paste0("chr", seq(1:22))) {
+  hapmap_rates_list[[chrom]] <- read_tsv(
+    paste0("/public_data_resources/recomb_hg38/genetic_map_GRCh38_", chrom, ".txt")
+  )
+}
+hapmap_rates <- do.call(rbind, hapmap_rates_list)
+hapmap_rates <- hapmap_rates %>%
+  dplyr::arrange(chrom, pos)
+
+hapmap_by_chr <- split(hapmap_rates, hapmap_rates$chrom)
+```
+
+```{r}
+compute_recomb_summary <- function(regions_gr, hapmap_by_chr) {
+
+  chroms <- as.character(seqnames(regions_gr))
+  starts <- start(regions_gr)
+  ends   <- end(regions_gr)
+  len_bp <- ends - starts + 1L
+
+  n <- length(chroms)
+  cm_start <- numeric(n)
+  cm_end   <- numeric(n)
+
+  for (i in seq_len(n)) {
+    map_chr <- hapmap_by_chr[[chroms[i]]]
+    if (is.null(map_chr)) {
+      cm_start[i] <- NA_real_
+      cm_end[i]   <- NA_real_
+    } else {
+      cm_start[i] <- approx(map_chr$pos, map_chr$pos_cm,
+                            xout = starts[i], rule = 2)$y
+      cm_end[i]   <- approx(map_chr$pos, map_chr$pos_cm,
+                            xout = ends[i],   rule = 2)$y
+    }
+  }
+
+  cm_span <- cm_end - cm_start
+  rate_cM_Mb <- round(cm_span / (len_bp / 1e6), 3)
+
+  total_cm     <- sum(cm_span, na.rm = TRUE)
+  total_bp     <- sum(len_bp, na.rm = TRUE)
+  overall_rate <- total_cm / (total_bp / 1e6)
+
+  per_region <- tibble::tibble(
+    chromosome      = chroms,
+    start_position      = starts,
+    end_position        = ends,
+    len_bp     = len_bp,
+    cm_start   = cm_start,
+    cm_end     = cm_end,
+    cm_span    = cm_span,
+    rate_cM_Mb = rate_cM_Mb
+  )
+
+  list(
+    total_cm     = total_cm,
+    total_bp     = total_bp,
+    overall_rate = overall_rate,
+    per_region   = per_region
+  )
+}
+```
+
+Summarise recomb rates for regions
+```{r}
+obs_rec <- compute_recomb_summary(regions_gr, hapmap_by_chr)
+obs_rec
+```
+
+Tabulate
+Region chr20q31M~64M requires renaming
+```{r}
+regions_edit <- regions_table %>%
+  left_join(gene_summary_obs$per_region, by = c("chromosome", "start_position", "end_position")) %>%
+  left_join(obs_rec$per_region, by = c("chromosome", "start_position", "end_position")) %>%
+  dplyr::select(ts_name, prop_feature, rate_cM_Mb) %>%
+  mutate(ts_name = ifelse(ts_name == "chr20q31M~", "chr20q31M~64M", ts_name))
+colnames(regions_edit) <- c("region_name", "genic_proportion", "recomb_rate_cM_Mb")
+
+inference_regions %>% 
+  left_join(regions_edit) %>%
+  as.data.frame() %>%
+  mutate(
+    genic_proportion = ifelse(region_name == "Total", round(gene_summary_obs$overall_prop,3), genic_proportion),
+    recomb_rate_cM_Mb = ifelse(region_name == "Total", round(obs_rec$overall_rate,3), recomb_rate_cM_Mb)
+  ) %>%
+  write_csv("../data/inference_regions_expanded.csv")
+```
+
+Chromosome sizes (for random sampling)
+```{r}
+fasta_template <- config$paths$fasta_ancestor
+chrom_nums <- 1:22
+fasta_paths <- glue(fasta_template, chrom_no_prefix = chrom_nums)
+fai_paths   <- paste0(fasta_paths, ".fai")
+chrom_sizes <- purrr::map_dfr(seq_along(chrom_nums), function(i) {
+  read_tsv(
+    fai_paths[i],
+    col_names = c("name", "length", "offset", "line_bases", "line_width"),
+    col_types = "cniii"
+  ) %>%
+    # Each ancestor FASTA is per chromosome, so this should be a single row;
+    # we use our known chr number to standardise the name.
+    transmute(
+      chromosome = paste0("chr", chrom_nums[i]),
+      length = length
+    )
+})
+```
+
+Get the autosomal regions lengths
+```{r}
+genome_autosomes <- GRanges(
+  seqnames = chrom_sizes$chromosome,
+  ranges   = IRanges(start = 1L, end = chrom_sizes$length)
+)
+```
+
+Callable genome only? Excluding assembly gaps.
+```{r}
+cyto <- read_tsv(
+  paths$cytoband,
+  col_names = c("chromosome", "start", "end", "band", "stain")
+)
+
+centromeres_gr <- cyto %>%
+  filter(
+    stain %in% c("acen", "gvar")
+  ) %>%
+  transmute(seqnames = chromosome,
+            start    = start,
+            end      = end) %>%
+  { GRanges(seqnames = .$seqnames,
+            ranges   = IRanges(start = .$start + 1, end = .$end)) } %>%  # BED→GRanges
+  reduce() 
+
+gaps_df <- readr::read_tsv(
+  paths$gaps,
+  col_names = c("bin", "chromosome", "start", "end", 
+                "ix", "n", "size", "type", "bridge")
+)
+
+gaps_gr <- gaps_df %>%
+  filter(chromosome %in% paste0("chr", 1:22)) %>%
+  mutate(
+    # gap.txt is 0-based start, 1-based end → convert to GRanges:
+    start = start + 1L
+  ) %>%
+  transmute(
+    seqnames = chromosome,
+    start,
+    end
+  ) %>%
+  { GRanges(seqnames = .$seqnames,
+            ranges   = IRanges(start = .$start, end = .$end)) } %>%
+  reduce()
+```
+
+Get only autosomal regions without gaps (to sample from)
+```{r}
+autosomes <- chrom_sizes$chromosome   # e.g. "chr1".."chr22"
+centromeres_gr <- keepSeqlevels(centromeres_gr, autosomes, pruning.mode = "coarse")
+gaps_gr        <- keepSeqlevels(gaps_gr,        autosomes, pruning.mode = "coarse")
+
+bad_regions_gr <- reduce(c(centromeres_gr, gaps_gr))
+good_regions_gr <- GenomicRanges::setdiff(genome_autosomes, bad_regions_gr)
+good_regions_gr <- good_regions_gr[width(good_regions_gr) > 0]
+```
+
+```{r}
+feature_content_in_callable <- function(callable_gr, feature_cov) {
+
+  chroms <- as.character(seqnames(callable_gr))
+  starts <- start(callable_gr)
+  ends   <- end(callable_gr)
+  len_bp <- ends - starts + 1L
+
+  n <- length(chroms)
+  feature_bp <- numeric(n)
+
+  for (i in seq_len(n)) {
+    cov_chr <- feature_cov[[chroms[i]]]
+    if (is.null(cov_chr)) {
+      feature_bp[i] <- 0
+    } else {
+      v <- Views(cov_chr, starts[i], ends[i])
+      feature_bp[i] <- sum(viewSums(v))
+    }
+  }
+
+  total_callable_bp <- sum(len_bp)
+  total_feature_bp  <- sum(feature_bp)
+  overall_prop      <- total_feature_bp / total_callable_bp
+
+  list(
+    total_feature_bp  = total_feature_bp,
+    total_callable_bp = total_callable_bp,
+    overall_prop      = overall_prop
+  )
+}
+```
+
+```{r}
+gene_content_callable <- feature_content_in_callable(good_regions_gr, genes_cov)
+gene_content_callable
+```
+
+Total callable genome
+```{r}
+rec_callable <- compute_recomb_summary(good_regions_gr, hapmap_by_chr)
+rec_callable
+```
+
+Precompute the list of possible regions to subsample from
+```{r}
+precompute_good_regions <- function(good_regions_gr, len) {
+  w <- width(good_regions_gr)
+  starts_per_region <- pmax(w - len + 1L, 0L)
+
+  keep <- starts_per_region > 0L
+
+  list(
+    regions          = good_regions_gr[keep],
+    starts_per_region = as.numeric(starts_per_region[keep]),  # numeric avoids int overflow
+    n_regions        = sum(keep)
+  )
+}
+
+len_levels <- sort(unique(region_lengths))
+
+precomp_list <- lapply(
+  len_levels,
+  function(len) precompute_good_regions(good_regions_gr, len)
+)
+names(precomp_list) <- as.character(len_levels)
+```
+
+```{r}
+sample_one_region <- function(len, precomp) {
+  if (precomp$n_regions == 0L) {
+    stop("No good regions long enough to place length ", len)
+  }
+
+  # Pick a region, weighted by how many valid starts it contains
+  region_idx <- sample.int(
+    precomp$n_regions,
+    size = 1L,
+    prob = precomp$starts_per_region
+  )
+
+  region       <- precomp$regions[region_idx]
+  n_pos        <- precomp$starts_per_region[region_idx]
+  region_start <- start(region)
+
+  # Sample a start offset within that region
+  offset_in_region <- sample.int(n_pos, 1L) - 1L
+  start_pos        <- region_start + offset_in_region
+  end_pos          <- start_pos + len - 1L
+
+  GRanges(seqnames = seqnames(region),
+          ranges   = IRanges(start_pos, end_pos))
+}
+
+sample_random_regions <- function(region_lengths, precomp_list) {
+  regs <- vector("list", length(region_lengths))
+
+  for (i in seq_along(region_lengths)) {
+    len  <- region_lengths[i]
+    info <- precomp_list[[as.character(len)]]
+    regs[[i]] <- sample_one_region(len, info)
+  }
+
+  do.call(c, regs)
+}
+```
+
+Test a selection of sampled regions of same lengths
+```{r}
+rand_test_regions <- sample_random_regions(region_lengths, precomp_list)
+gene_summary_rand_test <- prop_bases_in_genes_summary(rand_test_regions,  genes_cov)
+gene_summary_rand_test
+```
+
+Run for 100 replicates
+```{r}
+set.seed(42)
+n_iter <- 100L
+```
+
+Iterate for 100 random draws of same region lengths
+```{r}
+rand_props <- replicate(n_iter, {
+    rand_regions <- sample_random_regions(region_lengths, precomp_list)
+    prop_bases_in_genes(rand_regions, genes_union)
+  })
+```
+
+```{r}
+gene_summary_obs$overall_prop
+summary(rand_props)
+
+p_gene <- plot_obs_vs_random(
+  random_values = rand_props,
+  observed_value = gene_summary_obs$overall_prop,
+  title = "Gene Content",
+  xlab  = "Proportion of bases in genes"
+)
+```
+
+```{r}
+len <- region_lengths[[1]]
+rand_region <- sample_one_region(len, precomp_list[[as.character(len)]])
+
+prop_bases_in_genes(rand_region, genes_union)
+compute_recomb_summary(rand_region, hapmap_by_chr)$overall_rate
+```
+
+Get overall rates from random sample of recombination rates
+```{r}
+rand_rates <- replicate(n_iter, {
+    rand_regions <- sample_random_regions(region_lengths, precomp_list)
+    compute_recomb_summary(rand_regions, hapmap_by_chr)$overall_rate
+  })
+```
+
+Compare ours to the random samples?
+```{r}
+obs_rec$overall_rate
+summary(rand_rates)
+
+p_rec <- plot_obs_vs_random(
+  random_values = rand_rates,
+  observed_value = obs_rec$overall_rate,
+  title = "Recombination Rate",
+  xlab  = "Recombination rate (cM/Mb)"
+)
+```
+
+Function to calculate the mean of Relate Age estimates in a specified list of regions
+```{r, eval = FALSE}
+relate_age_summary <- function(regions_gr, csv_path=paths$relate_ages_csv) {
+  chroms <- as.character(seqnames(regions_gr))
+  regions_dt <- data.table(
+    chr = chroms,
+    start = start(regions_gr),
+    end = end(regions_gr),
+    len_bp = width(regions_gr),
+    region_id = seq_along(regions_gr)
+  )
+  
+  setkey(regions_dt, chr, start, end)
+  relate_dt <- fread(cmd = paste("zstd -dc", shQuote(csv_path)))
+  relate_dt[, chr := paste0("chr", as.character(chr))]
+  relate_dt[, `:=`(start = pos_hg38, end = pos_hg38)]
+  setkey(relate_dt, chr, start, end)
+  hits <- foverlaps(relate_dt, regions_dt, by.x = c("chr", "start", "end"),
+                    by.y = c("chr", "start", "end"), nomatch = 0L)
+  means_per_region <- hits[, .(mean_age = mean(age)), by = region_id]
+  per_region <- regions_dt[means_per_region, on = "region_id"]
+  overall_mean <- with(per_region, sum(len_bp * mean_age) / sum(len_bp))
+  list(
+    overall_mean = overall_mean,
+    per_region = per_region[, .(chromosome = chr, start_position = start,
+                                end_position = end, len_bp, mean_age)]
+  )
+}
+```
+
+Compute Relate age means for 100 random region sets and the observed regions and store. 
+This requires a dataset too large to include in the repository, which was constructed 
+using tgp_comparison/region_evaluation.py.
+
+```{r, eval = FALSE}
+random_relate_means <- replicate(n_iter, {
+    rand_regions <- sample_random_regions(region_lengths, precomp_list)
+    relate_age_summary(rand_regions)$overall_mean
+  })
+obs_relate_means <- relate_age_summary(regions_gr)
+
+df_out <- dplyr::bind_rows(
+  tibble::tibble(type = "random",   overall_mean = random_relate_means),
+  tibble::tibble(type = "observed", overall_mean = obs_relate_means$overall_mean)
+)
+readr::write_csv(df_out, paths$relate_means_csv)
+```
+
+Extract the mean age data and plot (works with data included in this repository)
+
+```{r}
+df <- readr::read_csv(paths$relate_means_csv)
+random_values <- df$overall_mean[df$type == "random"]
+observed_value <- df$overall_mean[df$type == "observed"][1]
+
+p_relate <- plot_obs_vs_random(
+  random_values = random_values,
+  observed_value = observed_value,
+  title = "Relate age estimates",
+  xlab  = "Mean Allele age (generations ago)"
+)
+```
+
+Combine and plot
+```{r, fig.width = 7, fig.height = 10}
+comb_random_plot <- ggarrange(
+  p_gene, p_rec, p_relate, nrow = 3,
+  labels = c("a", "b", "c")
+)
+comb_random_plot
+```
+
+```{r}
+ggsave(paste0(paths$plots_dir, "genic_and_recomb_vs_random.pdf"), comb_random_plot, width = 7, height = 7)
+```
+
+#### Summarise allele ages by consequence category
+
+VEP should encode most severe as 1st in order...
+```{r}
+ts_lf_merge %<>%
+  mutate(
+    consequence = ifelse(is.na(consequence), "intergenic_variant", consequence)
+  ) %>%
+  separate(consequence, sep = ",", into = c("tmp1", "tmp2"))  %>%
+  # split ampersand-delimited sub-terms too
+  separate(tmp1, sep = "&", into = c("consequence_new", "tmp12"))  %>%
+  dplyr::select(-contains("tmp"))  %>%
+  mutate(
+    consequence_cat = case_when(
+      consequence_new %in% c("start_lost", "stop_lost", "stop_gained") ~ "Protein-truncating",
+      consequence_new %in% c("splice_acceptor_variant", "splice_donor_variant") ~ "Splice-altering",
+      consequence_new == "missense_variant" ~ "Missense",
+      consequence_new %in% c("splice_region_variant", "splice_polypyrimidine_tract_variant") ~ "Splice-region",
+      consequence_new == "synonymous_variant" ~ "Synonymous",
+      consequence_new == "intergenic_variant" ~ "Non-coding"
+    )
+  )
+
+order_consq_cats <-
+  c(
+    "Non-coding",
+    "Synonymous",
+    "Splice-region",
+    "Missense",
+    "Protein-truncating",
+    "Splice-altering"
+  )
+```
+
+Tabulate statistics
+```{r}
+stats_per_consq <- ts_lf_merge |>
+  as_tibble() |>
+  filter(mutation_root_parent == FALSE) |>
+  group_by(consequence_cat) |>
+  summarise(
+    n_mutations = n(),
+    mean_age   = mean(mean_time, na.rm = TRUE),
+    sd_age      = sd(mean_time, na.rm = TRUE),
+    gm_age = exp(mean(log(mean_time), na.rm = TRUE)),
+    median_age  = median(mean_time, na.rm = TRUE)
+  ) |>
+  as_tibble() |>
+  mutate(
+    consequence_cat = factor(consequence_cat, levels = order_consq_cats),
+    percentage_of_total = 100 * (n_mutations / sum(n_mutations))
+  ) |>
+  arrange(consequence_cat)
+knitr::kable(stats_per_consq, bookends = FALSE)
+```
+
+As bar plot of allele counts
+```{r}
+plot_consq_bar <- stats_per_consq |>
+  ggplot(aes(
+    x = consequence_cat, y = n_mutations / 1000000
+  )) +
+  geom_bar(stat = "identity", fill = "#005eb8", colour = "black", width = 0.5) +
+  theme_minimal(base_size = 20) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "NONE",
+    axis.text.x = element_text(size = 0.1, colour = "white")
+  ) +
+  geom_text(
+    aes(label = paste0(round(percentage_of_total, 2), "%"), vjust = -0.5, size = 5)
+  ) +
+  labs(
+    x = "",
+    y = "Mutations (millions)",
+  ) +
+  scale_y_continuous(limits = c(0, 25))
+```
+
+As violin plot (with point at geometric mean)
+```{r}
+consq_cat_df <- ts_lf_merge |>
+  filter(mutation_root_parent == FALSE) |>
+  dplyr::select(
+    mean_time, consequence_cat
+  ) |>
+  as_tibble() |>
+  mutate(consequence_cat = factor(consequence_cat, levels = order_consq_cats))
+```
+
+```{r}
+plot_consq_violin <- consq_cat_df |>
+  ggplot(aes(x = consequence_cat, y = mean_time)) +
+  geom_violin(fill = "#005eb8", colour = "black") +
+  # point at geometric mean
+  geom_point(data = stats_per_consq, aes(y = gm_age),
+             shape = 23, size = 5, fill = "black", colour = "black", stroke = 0.6) +
+  geom_text(data = stats_per_consq, aes(y = gm_age, label = label_comma(accuracy = 1)(gm_age)),
+            size = 5, colour = "black", vjust = 2.1) +
+  scale_y_log10( breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)) ) + 
+  annotation_logticks(sides = "l") + 
+  theme_minimal(base_size = 20) + 
+  theme( 
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  ) +
+  labs(x = "Consequence", y = "Allele age (generations ago)")
+```
+
+Combine the two
+```{r, fig.width = 8, fig.height = 9}
+plot_consq_comb <- plot_grid(
+  plot_consq_bar,
+  plot_consq_violin,
+  align = "v",
+  ncol = 1,
+  labels = c("a", "b"),
+  rel_heights = c(0.5, 1)
+)
+plot_consq_comb 
+```
+
+```{r}
+ggsave(paste0(paths$plots_dir, "consq_comb_violinbar.pdf"), plot_consq_comb, width = 8, height = 9)
+```
+
+As bar plot of "average" mutation ages (as in Fu et al. 2012, Figure 1)
+- The non-log transformed scales + mean makes the differences far more apparent here.
+```{r}
+mean_cl_t <- function(y){
+  y <- y[is.finite(y)]
+  n <- length(y); m <- mean(y); se <- sd(y)/sqrt(n)
+  t <- qt(0.975, df = n - 1)
+  data.frame(y = m, ymin = m - t*se, ymax = m + t*se)
+}
+```
+
+```{r, fig.width = 7, fig.height = 7}
+mean_consq_bar <- ggplot(consq_cat_df,aes(x = consequence_cat, y = mean_time)) +
+  stat_summary(fun = mean, geom = "col", fill = "#005eb8", colour = "black", width = 0.65) +
+  stat_summary(fun.data = mean_cl_t, geom = "errorbar", width = 0.2) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(x = "Mutation consequence",
+       y = "Mean allele age (generations ago)") +
+  theme_minimal(base_size = 20) +
+  geom_point(data = stats_per_consq, aes(y = gm_age), shape = 23, size = 3.5,
+             fill = "white", colour = "black", stroke = 0.6) +
+  theme( 
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  )
+mean_consq_bar 
+```
+
+```{r}
+ggsave(paste0(paths$plots_dir, "mean_age_consq_bar.pdf"), mean_consq_bar, width = 7, height = 7)
+```
+
+#### Age vs edge span
+
+Age vs edge span plot
+```{r, fig.width = 7, fig.height = 7}
+mean_age_vs_edge_plot <- hex_scatter(
+  ts_lf_merge |>
+    filter(mutation_root_parent == FALSE),
+  x = mean_time, y = edge_span_kb,
+  xlab = "Allele age (generations ago)",
+  ylab = "Edge span (Kb)",
+  log_x = TRUE, log_y = TRUE,
+  bins = 100,
+  show_cor = TRUE, cor_method = "spearman",
+  cor_label_x = 5.3, cor_label_y = 4,
+  cor_coords = "log10",
+  cor_size = 5
+)
+mean_age_vs_edge_plot
+```
+
+```{r}
+ggsave(paste0(paths$plots_dir, "mean_age_vs_edge.pdf"), mean_age_vs_edge_plot, width = 7, height = 7)
+```
+
+#### Child and parent node time variance...
+Use coefficient of variation.
+```{r}
+cv_summary <- ts_lf_merge %>%
+  dplyr::select(child_node_mean_time, child_node_var_time,
+                parent_node_var_time, parent_node_mean_time) %>%
+  as_tibble() %>%
+  mutate(
+    child_cv  = ifelse(child_node_mean_time  > 0 & child_node_var_time  > 0,
+                       sqrt(child_node_var_time)  / child_node_mean_time,  NA_real_),
+    parent_cv = ifelse(parent_node_mean_time > 0 & parent_node_var_time > 0,
+                       sqrt(parent_node_var_time) / parent_node_mean_time, NA_real_),
+    child_lcv  = log1p(child_cv),
+    parent_lcv = log1p(parent_cv)
+  ) %>%
+  summarise(
+    # child
+    n_child              = sum(!is.na(child_cv)),
+    median_cv_child      = median(child_cv, na.rm = TRUE),
+    iqr_cv_child         = IQR(child_cv, na.rm = TRUE),
+    mean_cv_child        = mean(child_cv, na.rm = TRUE),
+    sd_cv_child          = sd(child_cv, na.rm = TRUE),
+    p95_cv_child         = as.numeric(quantile(child_cv, 0.95, na.rm = TRUE, names = FALSE)),
+    p99_cv_child         = as.numeric(quantile(child_cv, 0.99, na.rm = TRUE, names = FALSE)),
+    max_cv_child         = max(child_cv, na.rm = TRUE),
+    median_log_cv_child  = median(child_lcv, na.rm = TRUE),
+    mad_log_cv_child     = mad(child_lcv, constant = 1, na.rm = TRUE),
+
+    # parent
+    n_parent             = sum(!is.na(parent_cv)),
+    median_cv_parent     = median(parent_cv, na.rm = TRUE),
+    iqr_cv_parent        = IQR(parent_cv, na.rm = TRUE),
+    mean_cv_parent       = mean(parent_cv, na.rm = TRUE),
+    sd_cv_parent         = sd(parent_cv, na.rm = TRUE),
+    p95_cv_parent        = as.numeric(quantile(parent_cv, 0.95, na.rm = TRUE, names = FALSE)),
+    p99_cv_parent        = as.numeric(quantile(parent_cv, 0.99, na.rm = TRUE, names = FALSE)),
+    max_cv_parent        = max(parent_cv, na.rm = TRUE),
+    median_log_cv_parent = median(parent_lcv, na.rm = TRUE),
+    mad_log_cv_parent    = mad(parent_lcv, constant = 1, na.rm = TRUE)
+  )
+
+cv_summary_long <- cv_summary %>%
+  pivot_longer(
+    cols = ends_with("_child") | ends_with("_parent"),
+    names_to = c("stat", "node"),
+    names_sep = "_(?=[^_]+$)",
+    values_to = "value"
+  ) %>%
+  pivot_wider(
+    names_from = stat,
+    values_from = value
+  )
+knitr::kable(cv_summary_long)
+```
+
+Just for the mutations below the root...
+```{r}
+cv_summary_root <- ts_lf_merge %>%
+  filter(mutation_root_parent) %>%
+  dplyr::select(child_node_mean_time, child_node_var_time,parent_node_var_time, parent_node_mean_time) %>%
+  as_tibble() %>%
+  mutate(
+    child_cv  = ifelse(child_node_mean_time  > 0 & child_node_var_time  > 0,
+                       sqrt(child_node_var_time)  / child_node_mean_time,  NA_real_),
+    parent_cv = ifelse(parent_node_mean_time > 0 & parent_node_var_time > 0,
+                       sqrt(parent_node_var_time) / parent_node_mean_time, NA_real_),
+    child_lcv  = log1p(child_cv),
+    parent_lcv = log1p(parent_cv)
+  ) %>%
+  summarise(
+    # child
+    n_child              = sum(!is.na(child_cv)),
+    median_cv_child      = median(child_cv, na.rm = TRUE),
+    iqr_cv_child         = IQR(child_cv, na.rm = TRUE),
+    mean_cv_child        = mean(child_cv, na.rm = TRUE),
+    sd_cv_child          = sd(child_cv, na.rm = TRUE),
+    p95_cv_child         = as.numeric(quantile(child_cv, 0.95, na.rm = TRUE, names = FALSE)),
+    p99_cv_child         = as.numeric(quantile(child_cv, 0.99, na.rm = TRUE, names = FALSE)),
+    max_cv_child         = max(child_cv, na.rm = TRUE),
+    median_log_cv_child  = median(child_lcv, na.rm = TRUE),
+    mad_log_cv_child     = mad(child_lcv, constant = 1, na.rm = TRUE),
+
+    # parent
+    n_parent             = sum(!is.na(parent_cv)),
+    median_cv_parent     = median(parent_cv, na.rm = TRUE),
+    iqr_cv_parent        = IQR(parent_cv, na.rm = TRUE),
+    mean_cv_parent       = mean(parent_cv, na.rm = TRUE),
+    sd_cv_parent         = sd(parent_cv, na.rm = TRUE),
+    p95_cv_parent        = as.numeric(quantile(parent_cv, 0.95, na.rm = TRUE, names = FALSE)),
+    p99_cv_parent        = as.numeric(quantile(parent_cv, 0.99, na.rm = TRUE, names = FALSE)),
+    max_cv_parent        = max(parent_cv, na.rm = TRUE),
+    median_log_cv_parent = median(parent_lcv, na.rm = TRUE),
+    mad_log_cv_parent    = mad(parent_lcv, constant = 1, na.rm = TRUE)
+  )
+
+cv_summary_long_root <- cv_summary_root %>%
+  pivot_longer(
+    cols = ends_with("_child") | ends_with("_parent"),
+    names_to = c("stat", "node"),
+    names_sep = "_(?=[^_]+$)",
+    values_to = "value"
+  ) %>%
+  pivot_wider(
+    names_from = stat,
+    values_from = value
+  )
+knitr::kable(cv_summary_long_root)
+```

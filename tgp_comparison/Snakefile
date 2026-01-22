@@ -1,0 +1,153 @@
+from pathlib import Path
+import steps
+configfile: "config.yaml"
+shell.prefix(config["prefix"])
+
+data_dir = Path(config["data_dir"])
+results_dir = Path(config["results_dir"])
+progress_dir = Path(config["progress_dir"])
+
+rule all:
+    input:
+        expand(
+            results_dir / "dataframes" / "merged_chr{chr}.csv",
+            chr=config["chr"],
+        )
+
+rule extract_singletons:
+    input: 
+        data_dir /
+         "vcf" / 
+         "20201028_CCDG_14151_B01_GRM_WGS_2020-08-05_chr{chr}.recalibrated_variants.vcf.gz"
+    output:
+        results_dir / "singletons" /"singletons_chr{chr}.tsv"
+    shell:
+        "bash scripts/extract_singletons.sh {input} {output}"
+        
+rule process_singletons:
+    input: 
+        stns=results_dir / "singletons" /"singletons_chr{chr}.tsv",
+        anc=data_dir / "homo_sapiens_ancestor_GRCh38" / "homo_sapiens_ancestor_{chr}.fa"
+    output:
+        results_dir / "singletons" /"processed_singletons_chr{chr}.tsv"
+    run:
+        steps.process_singletons(Path(input.stns),
+                                 Path(output[0]),
+                                 ancestral_array_path=Path(input.anc))
+
+rule batch_add_singletons:
+    input: 
+        dir=data_dir / "tsdate" / "chr{chr}",
+        csv=results_dir / "singletons" /"processed_singletons_chr{chr}.tsv"
+    output:
+        results_dir / "tsdate" / "chr{chr}" / "with_stns" / "stns.added"
+    run:
+        steps.batch_add_singletons(input_dir=Path(input.dir),
+                                    input_csv=Path(input.csv),
+                                    output=Path(output[0]))
+                                    
+rule run_tsdate:
+    input:
+        results_dir / "tsdate" / "chr{chr}" / "with_stns" / "stns.added"
+    output:
+        results_dir / "tsdate" / "chr{chr}" / "metadata.json"
+    log:
+        progress_dir / "run_tsdate" / "chr{chr}.log"
+    run:
+        with open(log[0], "w") as log_file:
+            steps.run_tsdate(Path(input[0]),
+                            metadata_path=Path(output[0]),
+                            mutation_rate=config["mutation_rate"])
+
+
+rule extract_tsdate_data:
+    input: 
+        metadata=results_dir / "tsdate" / "chr{chr}" / "metadata.json"
+    output:
+        folder=results_dir / "dataframes" / "tsdate_chr{chr}.csv"
+    run:
+        steps.extract_tsdate_data(input=Path(input.metadata),
+                                    output=Path(output.folder),
+                                    chr=wildcards.chr)
+
+rule extract_geva_data:
+    input:
+        data_dir / "geva" / "atlas.chr{chr}.csv.gz"
+    output:
+        results_dir / "dataframes" / "geva_chr{chr}.csv"
+    run:
+        steps.extract_geva_data(Path(input[0]), Path(output[0]))
+
+rule extract_singer_data:
+    input:
+        data_dir / "singer" / "african_chr{chr}_0.tsz"
+    output:
+        results_dir / "dataframes" / "singer_chr{chr}.csv"
+    run:
+        steps.extract_singer_data(input=Path(input[0]),
+                                  output=Path(output[0]),
+                                  chr=wildcards.chr)
+
+rule combine_relate_data:
+    input:
+        data_dir / "relate"
+    output:
+        results_dir / "dataframes" / "full_relate_chr{chr}.csv"
+    run:
+        steps.combine_relate_data(input=Path(input[0]),
+                                  output=Path(output[0]),
+                                  chr=wildcards.chr)
+                                  
+rule aggregate_relate_data:
+    input:
+        results_dir / "dataframes" / "full_relate_chr{chr}.csv"
+    output:
+        results_dir / "dataframes" / "relate_chr{chr}.csv"
+    run:
+        steps.aggregate_relate_data(input=Path(input[0]),
+                                  output=Path(output[0]),
+                                  metadata_path=config["metadata_path"])
+
+rule combine_coalNN_data:
+    input:
+        data_dir / "coalNN"
+    output:
+        results_dir / "dataframes" / "full_coalNN_chr{chr}.csv"
+    run:
+        steps.combine_coalNN_data(input=Path(input[0]),
+                                  output=Path(output[0]),
+                                  chr=wildcards.chr)
+
+rule aggregate_coalNN_data:
+    input:
+        results_dir / "dataframes" / "full_coalNN_chr{chr}.csv"
+    output:
+        results_dir / "dataframes" / "coalNN_chr{chr}.csv"
+    run:
+        steps.aggregate_coalNN_data(input=Path(input[0]),
+                                    output=Path(output[0]),
+                                    metadata_path=config["metadata_path"])
+
+rule check_data:
+    input:
+        expand(
+            results_dir / "dataframes" / "{method}_chr{chr}.csv",
+            method=config["methods"],
+            chr=config["chr"]
+        )
+    output:
+        results_dir / "dataframes" / "chr{chr}.processed"
+    run:
+        Path(output[0]).touch()
+
+rule aggregate_data:
+    input:
+        results_dir / "dataframes" / "chr{chr}.processed"
+    output:
+        results_dir / "dataframes" / "merged_chr{chr}.csv"
+    run:
+        steps.aggregate_data(input=Path(input[0]),
+                               output=Path(output[0]),
+                               methods=config["methods"],
+                               chr=wildcards.chr)
+

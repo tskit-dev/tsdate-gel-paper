@@ -1,0 +1,831 @@
+---
+title: "GEL - Age of clinically classified variants"
+author: Sam Tallman
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+    toc_collapsed: true
+    toc_depth: 4
+    number_sections: true
+    code_folding: hide
+params:
+    ts_tsv: "trees_singletons_july25.tsv"
+---
+
+# Packages
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+```{r, message = FALSE}
+library(tidyverse)
+library(data.table)
+library(viridis)
+library(cowplot)
+library(ggpubr)
+library(reticulate)
+library(zoo)
+library(rtracklayer)
+library(grid)
+library(magrittr)
+library(glue)
+library(tidypolars)
+library(polars)
+
+## virtual env in container
+use_virtualenv("/opt/python_env", required = TRUE)
+```
+
+# Functions
+
+```{r, message = FALSE}
+## Python functions for reticulate
+source_python("functions/gel-funcs.py")
+
+## Source R functions
+source("functions/gel-funcs.R")
+source("functions/gel-plotting_funcs.R")
+```
+
+# Parameters
+
+File paths from config...
+```{r}
+config <- yaml::read_yaml("config/config.yaml")
+
+# Fill templates
+paths <- lapply(config$paths, function(path) {
+  if (grepl("\\{chrom\\}|\\{chrom_no_prefix\\}", path)) {
+    return(NULL)   # skip chrom-templated paths
+  }
+  glue(path,
+       data_dir       = config$paths$data_dir,
+       singletons_dir = config$paths$singletons_dir
+  )
+})
+
+paths <- Filter(Negate(is.null), paths)
+```
+
+# Data Ingest
+
+```{r}
+## List of trees (with singletons included)
+ts_tsv = params$ts_tsv
+trees_list <- read_tsv(ts_tsv)
+ts_dir <- paths$ts_dir
+```
+
+```{r, message = FALSE}
+pops_df <- read_tsv(paths$pops_path) %>%
+mutate(pop = ifelse(pop %in% c("fin", "oth"), "remaining", pop))
+
+hapmap_rates_list <- list()
+for (chrom in unique(trees_list$chromosome)) {
+  hapmap_rates_list[[chrom]] <- read_tsv(
+    paste0("/public_data_resources/recomb_hg38/genetic_map_GRCh38_", chrom, ".txt")
+  )
+}
+
+hapmap_rates <- do.call(rbind, hapmap_rates_list) %>%
+dplyr::rename(chromosome = chrom) %>%
+as_tibble()
+
+clinvar_snvs <- read_tsv(paths$clinvar_tsv) %>%
+  mutate(varkey = paste0(chromosome, "-", position))
+```
+
+Ploting data / parameters
+```{r}
+region_length <- 100000
+
+ensembl_transcripts <- readGFF(paths$genes_ensembl) %>%
+  mutate(chromosome = paste0("chr", seqid))
+
+pop_colours_vec <- c(
+  "#CC79A7", "#F0E442", "#0072B2", "#D55E00", "grey80", "#009E73", "#E69F00", "#56B4E9"
+)
+
+remain_collapse <- c("fin", "oth")
+group_numbers <- pops_df %>%
+count(pop) %>%
+arrange(n) %>%
+mutate(
+  pop = factor(pop, levels = pop),
+  Dataset = "GEL",
+  colour = pop_colours_vec
+)
+```
+
+## Read in data from all chromosome ts_dfs
+Columns used in the analyses...
+```{r}
+selected_columns <- c(
+    "chromosome",
+    "position",
+    "AC_ts",
+    "AF_ts",
+    "pop",
+    "panel_app_moi",
+    "cpg_transition",
+    "denovo_mutation",
+    "AM_score",
+    "AF_gnomad_exomes",
+    "AF_gnomad_genomes",
+    "mutation_root_parent",
+    "mean_time",
+    "ts_name",
+    "rsid",
+    "gene_symbol",
+    "consequence",
+    "lower_conf_time",
+    "upper_conf_time",
+    "acmg_classification_broad"
+  )
+```
+
+Lazy loading for filtering etc.
+```{r}
+ts_lf_merge <- scan_parquet_polars(file.path(paths$output_dir, "all-chr*-df.parquet")) |>
+  dplyr::select(all_of(selected_columns)) |>
+  compute() |>
+  filter(
+    mutation_root_parent == FALSE & !is.na(mean_time)
+  )
+```
+
+# Analysis 
+
+## Subset to clinically classified set
+Clinically classified mutation set
+- Ultra-rare AF < 0.1%
+- ACMG classification broad (GEL or Clinvar is B/LB, VUS, or P/LP)
+- Non-synonymous consequence types
+- Not deNovo mutations
+- Within PanelApp clinical grade disease genes
+```{r}
+checkpoint_clinical_tsv <- paste0(
+  paths$output_dir, "checkpoints/clinical_variants_ages-analysis.tsv.gz"
+)
+
+if (file.exists(checkpoint_clinical_tsv)) {
+  candidate_vars_df <- fread(
+    checkpoint_clinical_tsv
+  )
+} else {
+  candidate_vars_df <- ts_lf_merge %>%
+    filter(acmg_classification_broad %in% c("B/LB", "VUS", "P/LP")) %>%
+    drop_na(consequence) %>%
+    as_tibble() %>%
+    filter(
+      !panel_app_moi %in% c("Unknown", "BOTH") &
+      grepl("missense|start_lost|stop_lost|stop_gain|splice_acceptor|splice_donor", consequence) &
+      AC_ts <= max_ac_count(ts_df_merge, AF_thresh = 0.001)
+    )
+  candidate_vars_df %>%
+    fwrite(
+      checkpoint_clinical_tsv, 
+      sep = "\t", row.names = FALSE
+    )
+}
+```
+
+How many variants in total in the set?
+```{r}
+candidate_vars_df %<>%
+  filter(
+    !panel_app_moi %in% c("Unknown", "BOTH"),
+    mutation_root_parent == FALSE & !is.na(mean_time)
+  ) %>%
+  mutate(varkey = paste0(chromosome, "-", position))
+nrow(candidate_vars_df)
+```
+
+Count by ACMG/AMP classification
+```{r}
+candidate_vars_df %>%
+  count(acmg_classification_broad)
+```
+
+## Clinically classified singletons
+
+How many are singletons?
+```{r}
+candidate_vars_df_singletons <- candidate_vars_df %>%
+  filter(AC_ts == 1)
+nrow(candidate_vars_df_singletons)
+```
+
+Singletons by clinical classifcaition...
+```{r}
+singletons_acmg<- candidate_vars_df_singletons %>%
+filter(AC_ts == 1) %>%
+group_by(acmg_classification_broad) %>%
+summarise(
+  n_total = n(),
+  n_under_100 = mean(mean_time < 100),
+  gmean_time = exp(mean(log(mean_time)))
+)
+
+knitr::kable(singletons_acmg)
+```
+
+### Clinically classified singletons perm test
+
+Are these age distributions statistically different?
+```{r}
+patho_ac1_set <- candidate_vars_df_singletons  %>%
+filter(AC_ts == 1 & acmg_classification_broad == "P/LP")
+benign_ac1_set <- candidate_vars_df_singletons  %>%
+filter(AC_ts == 1 & acmg_classification_broad == "B/LB")
+vus_ac1_set <- candidate_vars_df_singletons %>% 
+filter(AC_ts == 1 & acmg_classification_broad == "VUS")
+```
+
+Patho vs benign permutation test...
+- Are patho younger than benign?
+```{r}
+perm_test(patho_ac1_set, benign_ac1_set)
+```
+
+Patho vs benign permutation test...
+- Are patho younger than VUS?
+```{r}
+perm_test(patho_ac1_set, vus_ac1_set)
+```
+
+How about the different sources of clinical classifications?
+```{r}
+patho_ac1_cva_set <- candidate_vars_df_singletons  %>%
+filter(AC_ts == 1 & acmg_classification_broad == "P/LP" & !varkey %in% clinvar_snvs$varkey)
+nrow(patho_ac1_cva_set)
+
+patho_ac1_clinvar_set <- candidate_vars_df_singletons  %>%
+filter(AC_ts == 1 & acmg_classification_broad == "P/LP" & varkey %in% clinvar_snvs$varkey)
+nrow(patho_ac1_clinvar_set)
+
+perm_test(patho_ac1_cva_set, patho_ac1_clinvar_set)
+```
+
+DAC > 1 clinical variants
+```{r}
+candidate_vars_df_non_singletons <- candidate_vars_df %>%
+filter(AC_ts != 1)
+nrow(candidate_vars_df_non_singletons)
+```
+
+Across the ACMG/AMP classifications
+```{r}
+candidate_vars_df_non_singletons %>%
+group_by(acmg_classification_broad) %>%
+summarise(
+  number = n(),
+  geo_mean_time = exp(mean(log(mean_time)))
+)
+```
+
+## Clinically classified DAC>1 variants (recurrence check)
+
+### Calculcate IBD spans
+NOTE: My functions are quite inefficient and slow. running this from scratch could take many hours!
+make sure to checkpoint...
+
+We want to ensure that some of the variants are unlikely to be recurrents
+- As this will affect age estimates / make things unreliable.
+```{r}
+## All trees
+ibd_df_list <- list()
+ts_names_vec <- unique(candidate_vars_df_non_singletons$ts_name)
+for (index in 1:length(ts_names_vec)) {
+  tree <- trees_list %>%
+    filter(grepl(ts_names_vec[index], ts_prefix))
+  ibd_file <- paste0(
+    paths$output_dir,
+    "checkpoints/all-",
+    ts_names_vec[index],
+    "-carriers_mrca_span-clinical.tsv.gz"
+  )
+  if (file.exists(ibd_file)) {
+    print(tree$chromosome)
+    ibd_df_list[[index]] <- read_tsv(ibd_file) %>%
+      mutate(chromosome = tree$chromosome)
+  } else {
+    var_df <- candidate_vars_df_non_singletons %>%
+      filter(ts_name == ts_names_vec[index])
+    ibd_df <- mrca_span_carriers(
+      ts_path = paste0(ts_dir, tree$ts_prefix, ".trees.tsz"),
+      positions = var_df$position
+    ) %>%
+      mutate(chromosome = tree$chromosome)
+    ibd_df %>%
+      fwrite(
+        file.path(ibd_file), sep = "\t"
+      )
+  }
+}
+```
+
+Generate the IBD data frame
+- stitch nearby segments together broken by small recombination events...
+- cM size from HapMap
+```{r, message = FALSE}
+ibd_candidates_df <- do.call(rbind, ibd_df_list) %>% 
+  stitch_ibd_segments_by_position() %>%
+  interpolate_cm(
+    recomb_map = hapmap_rates,
+    left = "ibd_left",
+    right = "ibd_right"
+  ) %>%
+  calculate_ibd_age() %>%
+  left_join(candidate_vars_df_non_singletons) %>%
+  filter(
+    position >= ibd_left & position <= ibd_right
+  )
+```
+
+### Calculcate edge spans
+```{r, message = FALSE}
+edge_span_list <- list()
+ts_names_vec <- unique(candidate_vars_df$ts_name)
+
+for (index in 1:length(ts_names_vec)) {
+  tree <- trees_list %>%
+    filter(grepl(ts_names_vec[index], ts_prefix))
+  edge_file <- paste0(
+    paths$output_dir,
+    "checkpoints/all-",
+    ts_names_vec[index],
+    "-candidates_edge_spans-clinical.tsv.gz"
+  )
+  if (file.exists(edge_file )) {
+    print(tree$chromosome)
+    edge_span_list[[index]] <- read_tsv(edge_file) %>%
+      mutate(chromosome = tree$chromosome)
+  } else {
+    var_df <- candidate_vars_df %>%
+      filter(ts_name == ts_names_vec[index])
+    edge_df  <- edge_span_mutations(
+      ts_path = paste0(ts_dir, tree$ts_prefix, ".trees.tsz"),
+      positions = var_df$position
+    ) %>%
+      mutate(chromosome = tree$chromosome)
+    edge_df %>%
+      fwrite(
+        file.path(edge_file), sep = "\t"
+      )
+     edge_span_list[[index]] <- edge_df
+  }
+}
+
+edge_candidates_df <- do.call(rbind, edge_span_list) %>%
+mutate(
+  edge_span = edge_right - edge_left
+)
+```
+
+### Apply recurrent check
+Rules:
+- Child node should not show extreme uncertainty in dating (Coefficient of Variaton < 1)
+- Mutation should not create a new edge in the tree sequence
+- The edge should be consistent with the neighbouring genealogy (< span of IBD between all carriers at that site)
+
+NOTE: Here IBD is defined as the span of the haplotype across which all carriers share the same MRCA
+
+We can get the complete edge spans for all mutations to check this.
+```{r}
+annot_df <- candidate_vars_df_non_singletons %>%
+left_join(ibd_candidates_df) %>%
+mutate(
+  within_ibd_span = ifelse(
+    (position <= ibd_right & position >= ibd_left), TRUE, FALSE
+)) %>%
+filter(within_ibd_span) %>%
+left_join(edge_candidates_df) %>%
+mutate(
+  edge_within_ibd_span = ifelse(
+    (ibd_right < edge_right & edge_left > ibd_left),
+    TRUE, FALSE
+  )
+) %>%
+mutate(
+  mutation_creates_edge = ifelse(
+    (edge_left == position | edge_right == position),
+    TRUE, FALSE
+  ),
+  mutation_creates_ibd = ifelse(
+    (ibd_left == position | ibd_right == position),
+    TRUE, FALSE
+  ),
+  child_cv  = ifelse(child_node_mean_time  > 0 & child_node_var_time  > 0,
+                       sqrt(child_node_var_time)  / child_node_mean_time,  NA_real_),
+  parent_cv = ifelse(parent_node_mean_time > 0 & parent_node_var_time > 0,
+                       sqrt(parent_node_var_time) / parent_node_mean_time, NA_real_),
+  poor_child_node = child_cv > 1,
+  poor_parent_node = parent_cv > 1,
+  ibd_smaller_than_edge = span <= edge_span
+) %>%
+mutate(
+  recurrent_check = case_when(
+    poor_child_node == TRUE ~ "Large uncertainty in child node time (CV > 1)",
+    poor_child_node == FALSE & mutation_creates_edge == TRUE ~ "Mutation position is edge boundary",
+    poor_child_node == FALSE & mutation_creates_edge == FALSE & ibd_smaller_than_edge == TRUE ~ "Shared IBD span <= edge span",
+    TRUE ~ "Consistent with single origin"
+  ),
+  recurrent_check = factor(
+    recurrent_check, levels = c(
+      "Large uncertainty in child node time (CV > 1)",
+      "Mutation position is edge boundary",
+      "Shared IBD span <= edge span",
+      "Consistent with single origin"
+    )
+  ),
+  recurrent_unlikely = recurrent_check == "Consistent with single origin"
+)
+```
+
+Recurrence by CpG>TPG transition
+Supplementary Plot
+```{r}
+custom_palette <- c("black", "darkred", "#FF6F61", "#69B3E7")
+plot_top <- annot_df %>%
+  mutate(
+    AC_ts_trunc = ifelse(AC_ts > 9, ">9", as.character(AC_ts)),
+    AC_ts_trunc = factor(AC_ts_trunc, levels = c(as.character(1:9), ">9"))
+  ) %>%
+  group_by(AC_ts_trunc, recurrent_check, cpg_transition) %>%
+  tally() %>%
+  group_by(cpg_transition, AC_ts_trunc) %>% 
+  mutate(
+    prop = n / sum(n),
+    cpg_transition = ifelse(cpg_transition, "CpG>TpG Transition", "Other mutation types")
+  ) %>%
+  ggplot(aes(x = factor(AC_ts_trunc), y = n, colour = recurrent_check, fill = recurrent_check)) +
+  geom_bar(stat = "identity") +
+  theme_classic(base_size = 20) +
+  theme(
+    strip.background = element_blank(),
+    legend.position = "top",
+    legend.title = element_blank(),  # Removes the legend title
+    legend.text = element_text(size = 15),  # Adjust legend text size
+    legend.key.size = unit(0.8, "cm"),  # Adjust legend key size
+    axis.line.x = element_blank()
+  ) +
+  facet_wrap(~cpg_transition) +
+  labs(
+    x = "Derived Allele Count (DAC)",
+    y = "Number of alleles"
+  ) +
+  scale_fill_manual(values = custom_palette) +
+  scale_colour_manual(values = custom_palette) +
+  guides(
+    colour = guide_legend(ncol = 2),  # Set legend to 2 columns
+    fill = guide_legend(ncol = 2)    # Set legend to 2 columns
+  )
+
+plot_bottom <- annot_df %>%
+mutate(cpg_transition = ifelse(cpg_transition, "CpG>TpG Transition", "Other mutation types")) %>%
+ggplot(aes(
+  x = log10(mean_time), y = log10(cM_length),
+  colour = recurrent_check, group = cpg_transition
+)) +
+geom_point(shape = 21, size = 0.75, alpha = 0.5) +
+theme_bw(base_size = 20) +
+theme(
+  strip.background = element_blank(),
+  panel.grid = element_blank(),
+  legend.position = "none"
+) +
+#geom_errorbar(
+#    aes(
+#      xmin = log10(child_node_mean_time),
+#      xmax = log10(parent_node_mean_time)
+#    ), alpha = 0.1
+#  ) +
+facet_wrap(~cpg_transition) +
+labs(
+  colour = "",
+  x = "Allele age (generations)",
+  y = "IBD length (cM)"
+) +
+scale_x_continuous(expand = c(0, 0), labels = scales::math_format(10^.x)) +
+scale_y_continuous(expand = c(0, 0), labels = scales::math_format(10^.x)) +
+    annotation_logticks(
+      sides = "bl",
+      color = "grey40"
+) +
+guides(
+  colour = guide_legend(ncol = 1),  # Set legend to 2 columns
+) +
+scale_colour_manual(values = custom_palette) +
+geom_smooth(method = "lm", colour = "black", se = FALSE, linetype = "dashed")
+```
+
+Combine plot
+```{r, fig.width = 8.5, fig.height = 8.5}
+## Arrange bottom plot
+recurrent_supp_plot <- ggarrange(
+  plot_top,
+  plot_bottom,
+  ncol = 1,
+  align = "v",
+  heights = c(1, 0.8)
+)
+recurrent_supp_plot 
+```
+
+Save plot
+```{r}
+ggsave(paste0(paths$plots_dir, "supp_plot_recurr.pdf"), recurrent_supp_plot, width = 9, height = 10.5)
+```
+
+Tabulate recurrence of doubletons
+```{r}
+recurr_doubletons_by_cpg <- annot_df %>%
+  filter(AC_ts == 2) %>%
+  group_by(recurrent_unlikely, cpg_transition) %>%
+  tally() %>%
+  group_by(cpg_transition) %>%
+  mutate(prop = n / sum(n)) %>%
+  arrange(desc(cpg_transition))
+knitr::kable(recurr_doubletons_by_cpg, bookends = FALSE)
+```
+
+## Clinically classified doubletons (non-recurrent)
+Not recurrent doubletons by clinical classifcaition...
+```{r}
+nonrecurrent_doubletons_acmg<- annot_df %>%
+filter(
+  recurrent_unlikely 
+) %>%
+filter(AC_ts == 2) %>%
+group_by(acmg_classification_broad) %>%
+summarise(
+  n_total = n(),
+  mean_length = mean(cM_length),
+  iqr_length = sd(cM_length),
+  n_under_100 = mean(mean_time < 100),
+  mean_child = mean(child_node_mean_time),
+  iqr_child = sd(child_node_mean_time),
+  gmean_time = exp(mean(log(mean_time)))
+)
+
+knitr::kable(nonrecurrent_doubletons_acmg)
+```
+
+### Clinically classified doubletons perm test
+Are these age distributions statistically different?
+```{r}
+patho_ac2_set <- annot_df %>%
+filter(recurrent_unlikely & AC_ts == 2 & acmg_classification_broad == "P/LP")
+benign_ac2_set <- annot_df %>%
+filter(recurrent_unlikely & AC_ts == 2 & acmg_classification_broad == "B/LB")
+vus_ac2_set <- annot_df %>% 
+filter(recurrent_unlikely & AC_ts == 2 & acmg_classification_broad == "VUS")
+```
+
+Patho vs benign permutation test...
+- Are patho younger than benign?
+```{r}
+perm_test(patho_ac2_set, benign_ac2_set)
+```
+
+Patho vs benign permutation test...
+- Are patho younger than VUS?
+```{r}
+perm_test(patho_ac2_set, vus_ac2_set)
+```
+
+### Allele age extremes by pop / clinically classifcation
+Allele age extremes for doubletons per pop
+Restrict to largest groups...
+
+- B/LB
+```{r}
+blb_pop <- annot_df %>%
+  filter(acmg_classification_broad == "B/LB" & AC_ts == 2) %>%
+  filter(recurrent_unlikely & pop %in% c("afr", "nfe", "eas", "sas")) %>%
+  group_by(pop, AC_ts) %>%
+  summarise(
+    n_variants = n(),
+    max_time = max(mean_time),
+    min_time = min(mean_time),
+    gmean_time = exp(mean(log(mean_time)))
+  ) %>%
+  filter(n_variants > 1)
+knitr::kable(blb_pop, bookends = FALSE)
+```
+
+- VUS
+```{r}
+vus_pop <- annot_df %>%
+  filter(acmg_classification_broad == "VUS"  & AC_ts == 2) %>%
+  filter(recurrent_unlikely & pop %in% c("afr", "nfe", "eas", "sas")) %>%
+  group_by(pop, AC_ts) %>%
+  summarise(
+    n_variants = n(),
+    max_time = max(mean_time),
+    min_time = min(mean_time),
+    gmean_time = exp(mean(log(mean_time)))
+  ) %>%
+  filter(n_variants > 1)
+knitr::kable(vus_pop, bookends = FALSE)
+```
+
+- P/LP
+```{r}
+plp_pop <- annot_df %>%
+  filter(acmg_classification_broad == "P/LP" & AC_ts == 2) %>%
+  filter(recurrent_unlikely & pop %in% c("afr", "nfe", "eas", "sas")) %>%
+  group_by(pop, AC_ts) %>%
+  summarise(
+    n_variants = n(),
+    max_time = max(mean_time),
+    min_time = min(mean_time),
+    gmean_time = exp(mean(log(mean_time)))
+  ) %>%
+  filter(n_variants > 1)
+knitr::kable(plp_pop, bookends = FALSE)
+```
+
+Supplemental plot
+- We want to show differences in ages despite population AC (2) matches.
+```{r, fig.width = 22, fig.height = 15}
+pop_vec <- c(as.character(group_numbers$pop), "nonspecific")
+pop_colours_vec = c(pop_colours_vec, "grey50")
+pop_cols <- stats::setNames(pop_colours_vec, pop_vec)
+
+pop_vec_reduced <- which(pop_vec %in% c("afr", "nfe", "eas", "sas"))
+plot_list <- setNames(lapply(pop_vec, plot_one_pop_classify), pop_vec)
+p_core  <- plot_grid(plotlist = plot_list[pop_vec_reduced])
+title_g <- ggdraw() +
+  draw_label("     Doubletons per PCA group by clinical classifcation (estimated non-recurrent)", x = 0, hjust = 0,
+             size = 30) +
+  theme(plot.margin = margin(0, 0, 8, 0))
+p_grid <- plot_grid(title_g, p_core, ncol = 1, rel_heights = c(0.08, 1))
+p_grid
+```
+
+Save to PDf
+```{r}
+ggsave(paste0(paths$plots_dir, "test_age_by_pop_doubletons.pdf"), p_grid, width = 22, height = 15)
+```
+
+Tabulate pathogenic variants
+- P/LP
+```{r}
+total_path <- annot_df %>%
+  filter(
+    pop %in% c("afr", "nfe", "eas", "sas") & AC_ts == 2 &
+    recurrent_unlikely & acmg_classification_broad == "P/LP"
+  ) %>%
+  dplyr::select(
+  chromosome, acmg_classification_broad, AC_ts, panel_app_moi, position, gene_symbol, consequence, mean_time, upper_conf_time, lower_conf_time, pop
+)
+knitr::kable(total_path, bookends = FALSE)
+```
+
+Tabulate only very old VUS?
+- VUS
+```{r}
+super_old_vus <- annot_df %>%
+  filter(
+    pop %in% c("afr", "nfe", "eas", "sas") & AC_ts == 2 &
+    recurrent_unlikely & acmg_classification_broad == "VUS" &
+    mean_time > (max(total_path$mean_time) * 10)
+  ) %>%
+  dplyr::select(
+  chromosome, position, rsid, acmg_classification_broad, AC_ts, panel_app_moi, position, gene_symbol, consequence, mean_time, upper_conf_time, lower_conf_time, pop
+  ) %>%
+  arrange(desc(mean_time))
+nrow(super_old_vus)
+knitr::kable(super_old_vus, bookends = FALSE)
+```
+
+Lets pick an interesting doubleton as plotting examples...
+```{r}
+examples_vus <- super_old_vus %>%
+  filter(AC_ts == 2 & pop != "nonspecific")
+examples_vus
+```
+
+### Extreme age example (DGCR8)
+EAS - doubleton VUS within DGCR8
+Very old mut - how does it compare to other VUS in EAS?
+```{r}
+comp_to_eas <- annot_df %>%
+  filter(AC_ts == 2, recurrent_unlikely & pop == "eas" & acmg_classification_broad == "VUS") %>%
+  as.data.frame() %>%
+  arrange(desc(mean_time)) 
+
+knitr::kable(
+  comp_to_eas %>%
+  dplyr::select(
+    chromosome, position, rsid, gene_symbol, consequence, mean_time, panel_app_moi, AM_score, lower_conf_time, upper_conf_time, span
+  )
+)
+```
+
+How many?
+```{r}
+nrow(comp_to_eas)
+```
+
+Average time among these?
+```{r}
+exp(mean(log(comp_to_eas$mean_time)))
+```
+
+The youngest is rs1555887956 within SLC2A10
+We can compare what the two look like...
+
+#### Example Figure Plot
+```{r}
+plot_legend <- group_numbers %>%
+pop_strat_bar_plot(base_size_num = 10, legend_text_size = 10,
+  legend_title_size = 10) +
+labs(
+  x = "",
+  y = ""
+) +
+scale_colour_manual(
+  values = pop_colours_vec
+) +
+scale_fill_manual(
+  values = pop_colours_vec
+) +
+theme(
+  legend.position = "top"
+)
+
+## Legend for the entire figure
+plot_legend <- as_ggplot(
+  get_legend(plot_legend)
+)
+```
+
+Get the oldest mutation EAS doubleton VUS from our clinical classification set
+```{r, messsage = FALSE}
+example_oldest_eas_doubleton_vus <- comp_to_eas %>%
+  filter(mean_time == max(mean_time))
+example1_plot <- combine_plots_with_data(
+  data_dir = paths$data_dir, 
+  example_df = example_oldest_eas_doubleton_vus, 
+  region_length = region_length, 
+  ts_df_merge = ts_lf_merge %>%
+    as_tibble(), 
+  pops_df = pops_df,
+  ts_dir = ts_dir,
+  trees_list = trees_list,
+  group_numbers = group_numbers, 
+  gene_colour = "#74c476",
+  ensembl_transcripts = ensembl_transcripts, 
+  mutation_title = str_split(example_oldest_eas_doubleton_vus$rsid, "&")[[1]][1],
+  annot_line = 20000, annot_text = "AMH-Denisovan split"
+)
+```
+
+Get the youngest mutation EAS doubleton VUS from our clinical classification set
+```{r, message = FALSE}
+example_youngest_eas_doubleton_vus <- comp_to_eas %>%
+  filter(mean_time == min(mean_time))
+
+example2_plot <- combine_plots_with_data(
+  data_dir = paths$output_dir, 
+  example_df = example_youngest_eas_doubleton_vus, 
+  region_length = region_length, 
+  ts_df_merge = ts_lf_merge %>%
+    as_tibble(),
+  pops_df = pops_df,
+  ts_dir = ts_dir,
+  trees_list = trees_list,
+  group_numbers = group_numbers,
+  ensembl_transcripts = ensembl_transcripts,
+  mutation_title = str_split(example_youngest_eas_doubleton_vus$rsid, "&")[[1]][1],
+  gene_colour = "#238b45", # biallelic
+  annot_line = 0, annot_text = ""
+)
+```
+
+Arrange both for figure
+```{r, fig.width = 6, fig.height = 8.5}
+eas_vus_doubletons_plot <- ggarrange(
+  plot_legend,
+  ggarrange(example1_plot, example2_plot, ncol = 1, labels = c("a", "b")),
+  ncol = 1,
+  heights = c(0.1, 1)
+)
+eas_vus_doubletons_plot
+```
+
+Save to PDF
+```{r}
+ggsave(paste0(paths$plots_dir, "vus_eas_example.pdf"), eas_vus_doubletons_plot, width = 6, height = 8.5)
+```
