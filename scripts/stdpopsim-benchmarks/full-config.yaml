@@ -1,0 +1,25 @@
+output-prefix: "full"
+trees-dir: "/sietch_colab/data_share/natep/gel-dating-paper/stdpopsim-benchmark/full"
+random-seed: 1024
+ep-iterations: 10
+rescaling-iterations: 3
+rescaling-intervals: 10000
+min-branch-length: 1.0e-8
+threads-per-job: 8
+max-freq: 0.001
+
+contig:
+    chromosome: "chr17"
+    genetic_map: "HapMapII_GRCh38"
+    left: 42.0e+6
+    right: 82.0e+6
+
+demogr-models:
+    OutOfAfrica_3G09:
+        samples: {"CEU": 5000, "CHB": 5000, "YRI": 5000}
+    OutOfAfricaArchaicAdmixture_5R19:
+        samples: {"CEU": 5000, "CHB": 5000, "YRI": 5000}
+    AmericanAdmixture_4B18:
+        samples: {"EUR": 3750, "AFR": 3750, "ASIA": 3750, "ADMIX": 3750}
+    Zigzag_1S14:
+        samples: {"generic": 15000}

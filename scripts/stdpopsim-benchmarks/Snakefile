@@ -1,0 +1,282 @@
+import os
+import numpy as np
+
+configfile: "test-config.yaml"
+
+RNG = np.random.default_rng(config["random-seed"])
+OUTPUT_PREFIX = config["output-prefix"]
+TREES_DIR = config["trees-dir"]
+THREADS_PER_JOB = config["threads-per-job"]
+EP_ITERATIONS = config["ep-iterations"]
+RESCALING_ITERATIONS = config["rescaling-iterations"]
+RESCALING_INTERVALS = config["rescaling-intervals"]
+MIN_BRANCH_LENGTH = config["min-branch-length"]
+MODELS = config["demogr-models"]
+MODEL_NAMES = sorted(MODELS.keys())
+CONTIG = config["contig"]
+SEEDS = {m: RNG.integers(2 ** 32 - 1, size=1).item() for m in MODELS}
+MAX_FREQ = config["max-freq"] 
+
+
+def rmse_and_bias(freq, true, infr, max_freq=int(1e6)):
+    keep = np.logical_and.reduce([
+        freq > -1,
+        freq < max_freq,
+        ~np.isnan(true), 
+        ~np.isnan(infr),
+    ])
+    denom = np.bincount(freq[keep], minlength=max_freq)
+    numer_bias = np.bincount(
+        freq[keep], 
+        weights=(infr - true)[keep], 
+        minlength=max_freq
+    )
+    numer_rmse = np.bincount(
+        freq[keep], 
+        weights=(infr - true)[keep] ** 2, 
+        minlength=max_freq,
+    )
+    return np.sqrt(numer_rmse / denom), numer_bias / denom
+
+
+rule all:
+    input:
+        plot = f"{OUTPUT_PREFIX}.pdf",
+        table = f"{OUTPUT_PREFIX}.tex",
+
+
+rule simulate:
+    output: trees = os.path.join(TREES_DIR, "{model}.simulate.tsz")
+    log: os.path.join(TREES_DIR, "{model}.simulate.log")
+    run:
+        import stdpopsim
+        import msprime
+        import tszip
+        import logging
+        logging.basicConfig(filename=str(log), filemode="w", level=logging.INFO)
+        engine = stdpopsim.get_engine("msprime")
+        homsap = stdpopsim.get_species("HomSap")
+        demogr = homsap.get_demographic_model(wildcards.model)
+        contig = homsap.get_contig(**CONTIG, mutation_rate=demogr.mutation_rate)
+        ts = engine.simulate(
+            contig=contig,
+            demographic_model=demogr,
+            msprime_model="dtwf",
+            msprime_change_model=[(100, "hudson")],
+            samples=MODELS[wildcards.model]["samples"],
+            seed=SEEDS[wildcards.model],
+        )
+        tszip.compress(ts.trim(), output.trees)
+
+
+rule infer:
+    input: trees = rules.simulate.output.trees
+    output: trees = os.path.join(TREES_DIR, "{model}.infer.tsz")
+    log: os.path.join(TREES_DIR, "{model}.infer.log")
+    threads: THREADS_PER_JOB
+    run:
+        import tsinfer
+        import tszip
+        import logging
+        logging.basicConfig(filename=str(log), filemode="w", level=logging.INFO)
+        data = tsinfer.SampleData.from_tree_sequence(tszip.load(input.trees))
+        ts = tsinfer.infer(data, num_threads=threads)
+        tszip.compress(ts.simplify(), output.trees)
+
+
+rule date:
+    input: trees = rules.infer.output.trees
+    output: 
+        variational = os.path.join(TREES_DIR, "{model}.variational.tsz"),
+        inside_outside = os.path.join(TREES_DIR, "{model}.inside_outside.tsz"),
+    log: os.path.join(TREES_DIR, "{model}.date.log")
+    run:
+        import tsdate
+        import tszip
+        import stdpopsim
+        import logging
+        logging.basicConfig(filename=str(log), filemode="w", level=logging.INFO)
+        homsap = stdpopsim.get_species("HomSap")
+        demogr = homsap.get_demographic_model(wildcards.model)
+        contig = homsap.get_contig(**CONTIG, mutation_rate=demogr.mutation_rate)
+        mu = contig.mutation_rate
+        ts = tszip.load(input.trees)
+        ne = ts.diversity(mode="site") / mu / 4
+        variational = tsdate.date(
+            tsdate.preprocess_ts(ts), 
+            mutation_rate=mu, 
+            max_iterations=EP_ITERATIONS,
+            rescaling_iterations=RESCALING_ITERATIONS,
+            rescaling_intervals=RESCALING_INTERVALS,
+            eps=MIN_BRANCH_LENGTH,
+            set_metadata=False,
+        )
+        # not splitting disjoint nodes for 'inside_outside' to mimic Wohns et al tsdate
+        inside_outside = tsdate.date(
+            ts, 
+            mutation_rate=mu, 
+            population_size=ne, 
+            method="inside_outside",
+        )
+        tszip.compress(variational, output.variational)
+        tszip.compress(inside_outside, output.inside_outside)
+      
+
+rule mutations:
+    input:
+        true = rules.simulate.output.trees,
+        variational = rules.date.output.variational,
+        inside_outside = rules.date.output.inside_outside,
+    output:
+        true = os.path.join(TREES_DIR, "{model}.true.npy"),
+        variational = os.path.join(TREES_DIR, "{model}.variational.npy"),
+        inside_outside = os.path.join(TREES_DIR, "{model}.inside_outside.npy"),
+        frequency = os.path.join(TREES_DIR, "{model}.frequency.npy"),
+    run:
+        import tskit
+        import tsdate
+        import tszip
+        true = tszip.load(input.true)
+        variational = tszip.load(input.variational)
+        inside_outside = tszip.load(input.inside_outside)
+        muts_per_site = np.bincount(variational.mutations_site, minlength=variational.num_sites)
+        biallelic = np.flatnonzero(muts_per_site == 1)
+        position_map = {variational.sites_position[s]: i for i, s in enumerate(biallelic)}
+
+        def mutation_frequency(ts):
+            freq = np.full(len(position_map), -1)
+            for t in ts.trees():
+                for m in t.mutations():
+                    pos = ts.sites_position[m.site]
+                    if m.edge != tskit.NULL and pos in position_map:
+                        i = position_map[pos]
+                        freq[i] = t.num_samples(m.node)
+            return freq 
+
+        def mutation_midpoint_age(ts):
+            ages = np.full(len(position_map), np.nan)
+            for t in ts.trees():
+                for m in t.mutations():
+                    pos = ts.sites_position[m.site]
+                    if m.edge != tskit.NULL and pos in position_map:
+                        i = position_map[pos]
+                        p, c = ts.edges_parent[m.edge], ts.edges_child[m.edge]
+                        ages[i] = (ts.nodes_time[p] + ts.nodes_time[c]) / 2
+            return ages
+
+        np.save(output.true, mutation_midpoint_age(true))
+        np.save(output.variational, mutation_midpoint_age(variational))
+        np.save(output.inside_outside, mutation_midpoint_age(inside_outside))
+        np.save(output.frequency, mutation_frequency(variational)) 
+
+                    
+rule plot:
+    input:
+        true = expand(rules.mutations.output.true, model=MODEL_NAMES),
+        variational = expand(rules.mutations.output.variational, model=MODEL_NAMES),
+        inside_outside = expand(rules.mutations.output.inside_outside, model=MODEL_NAMES),
+        frequency = expand(rules.mutations.output.frequency, model=MODEL_NAMES),
+    output:
+        plot = rules.all.input.plot,
+    run:
+        import matplotlib.pyplot as plt
+        rows, cols = 2, len(MODEL_NAMES)
+        fig, axs = plt.subplots(
+            rows, cols, 
+            figsize=(2 * cols + 2, 2 * rows + 1),
+            sharey="row", sharex=True,
+            constrained_layout=True,
+        )
+        for i, (tr, va, io, fr, nm) in enumerate(
+            zip(
+                input.true, 
+                input.variational, 
+                input.inside_outside, 
+                input.frequency,
+                MODEL_NAMES,
+            )
+        ): 
+            tr, va, io = [np.log10(np.load(x)) for x in [tr, va, io]]
+            fr = np.load(fr)
+            samples = sum(MODELS[nm]["samples"].values())
+            max_freq = int(2 * samples * MAX_FREQ)
+            va_rmse, va_bias = rmse_and_bias(fr, tr, va, max_freq)
+            io_rmse, io_bias = rmse_and_bias(fr, tr, io, max_freq)
+            va_kwargs = {"markersize":2, "color":"dodgerblue", "label":"variational"}
+            io_kwargs = {"markersize":2, "color":"firebrick", "label":"inside-outside"}
+            axs[0, i].plot(np.arange(1, max_freq), va_rmse[1:], "-o", **va_kwargs)
+            axs[0, i].plot(np.arange(1, max_freq), io_rmse[1:], "-o", **io_kwargs)
+            axs[0, i].axhline(y=0, color="black", linestyle="dashed")
+            axs[1, i].plot(np.arange(1, max_freq), va_bias[1:], "-o", **va_kwargs)
+            axs[1, i].plot(np.arange(1, max_freq), io_bias[1:], "-o", **io_kwargs)
+            axs[1, i].axhline(y=0, color="black", linestyle="dashed")
+            axs[0, i].set_title(nm, family="monospace", size=8)
+            if i == 0:
+                axs[0, i].set_ylabel("RMSE (log10 age)")
+                axs[1, i].set_ylabel("Bias (log10 age)")
+        fig.supxlabel(f"Mutation frequency (out of {samples} diploids)")
+        fig.legend(
+            *axs[0, 0].get_legend_handles_labels(),
+            loc="outside upper center",
+            frameon=False,
+            ncol=2,
+        )
+        plt.savefig(output.plot)
+
+        
+rule tabulate:
+    input:
+        true = expand(rules.mutations.output.true, model=MODEL_NAMES),
+        variational = expand(rules.mutations.output.variational, model=MODEL_NAMES),
+        inside_outside = expand(rules.mutations.output.inside_outside, model=MODEL_NAMES),
+        frequency = expand(rules.mutations.output.frequency, model=MODEL_NAMES),
+    output:
+        table = rules.all.input.table,
+    run:
+        handle = open(output.table, "w")
+        handle.write(r"\begin{tabular}{lcccc}" + "\n")
+        handle.write(
+            r" & \multicolumn{2}{c}{Variational} & "
+            r"\multicolumn{2}{c}{Inside-outside} \\ "
+            "\n"
+        )
+        handle.write(
+            r"\texttt{stdpopsim} model & "
+            r"Bias & RMSE & Bias & RMSE \\ " + "\n"
+        )
+        handle.write(r"\hline" + "\n")
+        for i, (tr, va, io, fr, nm) in enumerate(
+            zip(
+                input.true, 
+                input.variational, 
+                input.inside_outside, 
+                input.frequency,
+                MODEL_NAMES,
+            )
+        ): 
+            tr, va, io = [np.log10(np.load(x)) for x in [tr, va, io]]
+            fr = np.load(fr)
+            samples = sum(MODELS[nm]["samples"].values())
+            max_freq = int(2 * samples * MAX_FREQ)
+            # low frequency variants
+            fr_low = (fr >= max_freq).astype(int)
+            fr_low[fr == -1] = -1
+            va_low_rmse, va_low_bias = rmse_and_bias(fr_low, tr, va)
+            io_low_rmse, io_low_bias = rmse_and_bias(fr_low, tr, io)
+            # all variants
+            fr_all = np.zeros_like(fr)
+            fr_all[fr == -1] = -1
+            va_all_rmse, va_all_bias = rmse_and_bias(fr_all, tr, va)
+            io_all_rmse, io_all_bias = rmse_and_bias(fr_all, tr, io)
+            handle.write(
+                r"\texttt{" + nm.replace("_", r"\_") + r"} & " + 
+                fr"${va_all_bias[0]:.2f}$ (${va_low_bias[0]:.2f}$) & "
+                fr"${va_all_rmse[0]:.2f}$ (${va_low_rmse[0]:.2f}$) & "
+                fr"${io_all_bias[0]:.2f}$ (${io_low_bias[0]:.2f}$) & "
+                fr"${io_all_rmse[0]:.2f}$ (${io_low_rmse[0]:.2f}$) \\ "
+                "\n"
+            )
+        handle.write(r"\hline" + "\n")
+        handle.write(r"\end{tabular}")
+        handle.close()
+

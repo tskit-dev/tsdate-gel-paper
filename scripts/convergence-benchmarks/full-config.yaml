@@ -1,0 +1,12 @@
+output-prefix: "full"
+trees-dir: "/sietch_colab/data_share/natep/gel-dating-paper/convergence-benchmark/full"
+random-seed: 1024
+#trim-sequence-to: [2.0e+7, 3.0e+7]
+memory-per-job-gb: 100
+chromosome: 22
+sample-size-grid: [10, 100, 1000, 10000, 100000, 1000000]
+num-replicates: 3
+max-ep-iterations: 30
+default-resources:
+    mem_mb: 101000
+

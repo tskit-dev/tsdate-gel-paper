@@ -1,0 +1,282 @@
+import os
+import numpy as np
+
+configfile: "test-config.yaml"
+
+RNG = np.random.default_rng(config["random-seed"])
+OUTPUT_PREFIX = config["output-prefix"]
+TREES_DIR = config["trees-dir"]
+THREADS_PER_JOB = config["threads-per-job"]
+EP_ITERATIONS = config.get("ep-iterations", 10)
+RESCALING_ITERATIONS = config.get("rescaling-iterations", 3)
+RESCALING_INTERVALS = config.get("rescaling-intervals", 10000)
+MIN_BRANCH_LENGTH = config.get("min-branch-length", 1e-8)
+MODELS = config["demogr-models"]
+MODEL_NAMES = sorted(MODELS.keys())
+CONTIG = config["contig"]
+SEEDS = {m: RNG.integers(2 ** 32 - 1, size=1).item() for m in MODELS}
+MAX_FREQ = config["max-freq"] 
+COVERAGE_METRICS_PATH = f"{TREES_DIR}/{{model}}.coverage.pkl"
+INTERVAL_WIDTH = config["interval-width"]
+
+
+rule all:
+    input:
+        plot = f"{OUTPUT_PREFIX}.pdf",
+
+
+rule simulate:
+    output: trees = os.path.join(TREES_DIR, "{model}.simulate.tsz")
+    log: os.path.join(TREES_DIR, "{model}.simulate.log")
+    run:
+        import stdpopsim
+        import msprime
+        import tszip
+        import logging
+        logging.basicConfig(filename=str(log), filemode="w", level=logging.INFO)
+        engine = stdpopsim.get_engine("msprime")
+        homsap = stdpopsim.get_species("HomSap")
+        demogr = homsap.get_demographic_model(wildcards.model)
+        contig = homsap.get_contig(**CONTIG, mutation_rate=demogr.mutation_rate)
+        ts = engine.simulate(
+            contig=contig,
+            demographic_model=demogr,
+            msprime_model="dtwf",
+            msprime_change_model=[(100, "hudson")],
+            samples=MODELS[wildcards.model]["samples"],
+            seed=SEEDS[wildcards.model],
+        )
+        tszip.compress(ts.trim(), output.trees)
+
+
+rule infer:
+    input: trees = rules.simulate.output.trees
+    output: trees = os.path.join(TREES_DIR, "{model}.infer.tsz")
+    log: os.path.join(TREES_DIR, "{model}.infer.log")
+    threads: THREADS_PER_JOB
+    run:
+        import tsinfer
+        import tszip
+        import logging
+        logging.basicConfig(filename=str(log), filemode="w", level=logging.INFO)
+        data = tsinfer.SampleData.from_tree_sequence(tszip.load(input.trees))
+        ts = tsinfer.infer(data, num_threads=threads)
+        tszip.compress(ts.simplify(), output.trees)
+
+
+rule date:
+    input: 
+        simulate = rules.simulate.output.trees,
+        infer = rules.infer.output.trees,
+    output: 
+        simulate_trees = os.path.join(TREES_DIR, "{model}.simulate.date.tsz"),
+        infer_trees = os.path.join(TREES_DIR, "{model}.infer.date.tsz"),
+        simulate_mutation_posteriors = os.path.join(TREES_DIR, "{model}.simulate.date.mutation.npy"),
+        infer_mutation_posteriors = os.path.join(TREES_DIR, "{model}.infer.date.mutation.npy"),
+    log: os.path.join(TREES_DIR, "{model}.date.log")
+    run:
+        import tsdate
+        import tszip
+        import stdpopsim
+        import pickle
+        import logging
+        logging.basicConfig(filename=str(log), filemode="w", level=logging.INFO)
+        homsap = stdpopsim.get_species("HomSap")
+        demogr = homsap.get_demographic_model(wildcards.model)
+        contig = homsap.get_contig(**CONTIG, mutation_rate=demogr.mutation_rate)
+        mu = contig.mutation_rate
+        ts = tszip.load(input.simulate)
+        its = tszip.load(input.infer)
+        simulate, simulate_fit = tsdate.date(
+            ts,
+            mutation_rate=mu, 
+            max_iterations=EP_ITERATIONS,
+            rescaling_iterations=RESCALING_ITERATIONS,
+            rescaling_intervals=RESCALING_INTERVALS,
+            eps=MIN_BRANCH_LENGTH,
+            set_metadata=False,
+            return_fit=True,
+        )
+        infer, infer_fit = tsdate.date(
+            tsdate.preprocess_ts(its), 
+            mutation_rate=mu, 
+            max_iterations=EP_ITERATIONS,
+            rescaling_iterations=RESCALING_ITERATIONS,
+            rescaling_intervals=RESCALING_INTERVALS,
+            eps=MIN_BRANCH_LENGTH,
+            set_metadata=False,
+            return_fit=True,
+        )
+        tszip.compress(simulate, output.simulate_trees)
+        tszip.compress(infer, output.infer_trees)
+        np.save(output.simulate_mutation_posteriors, simulate_fit.mutation_posteriors())
+        np.save(output.infer_mutation_posteriors, infer_fit.mutation_posteriors())
+
+
+rule mutations:
+    input:
+        true_trees = rules.simulate.output.trees,
+        simulate_trees = rules.date.output.simulate_trees,
+        infer_trees = rules.date.output.infer_trees,
+        simulate_mutation_posteriors = rules.date.output.simulate_mutation_posteriors,
+        infer_mutation_posteriors = rules.date.output.infer_mutation_posteriors,
+    output:
+        simulate_mutation_intervals = os.path.join(TREES_DIR, "{model}.simulate.intervals.mutation.npy"),
+        infer_mutation_intervals = os.path.join(TREES_DIR, "{model}.infer.intervals.mutation.npy"),
+        mutation_frequency = os.path.join(TREES_DIR, "{model}.frequency.mutation.npy"),
+        mutation_age = os.path.join(TREES_DIR, "{model}.age.mutation.npy"),
+    params:
+        interval_width = INTERVAL_WIDTH,
+    run:
+        import tskit
+        import tszip
+        import scipy.stats
+
+        interval_width = np.array(params.interval_width)
+        true_trees = tszip.load(input.true_trees)
+        simulate_trees = tszip.load(input.simulate_trees)
+        simulate_mutation_posteriors = np.load(input.simulate_mutation_posteriors)
+        infer_trees = tszip.load(input.infer_trees)
+        infer_mutation_posteriors = np.load(input.infer_mutation_posteriors)
+        muts_per_site = np.bincount(infer_trees.mutations_site, minlength=infer_trees.num_sites)
+        biallelic = np.flatnonzero(muts_per_site == 1)
+        position_map = {infer_trees.sites_position[s]: i for i, s in enumerate(biallelic)}
+
+        def mutation_frequency(ts):
+            freq = np.full(len(position_map), -1)
+            biallelic = np.bincount(ts.mutations_site, minlength=ts.num_sites) == 1
+            for t in ts.trees():
+                for m in t.mutations():
+                    pos = ts.sites_position[m.site]
+                    if m.edge != tskit.NULL and biallelic[m.site] and pos in position_map:
+                        i = position_map[pos]
+                        freq[i] = t.num_samples(m.node)
+            return freq 
+
+        def mutation_age(ts):
+            ages = np.full(len(position_map), np.nan)
+            biallelic = np.bincount(ts.mutations_site, minlength=ts.num_sites) == 1
+            for t in ts.trees():
+                for m in t.mutations():
+                    pos = ts.sites_position[m.site]
+                    if m.edge != tskit.NULL and biallelic[m.site] and pos in position_map:
+                        i = position_map[pos]
+                        ages[i] = ts.mutations_time[m.id]
+            return ages
+
+        def mutation_ci(ts, posteriors, intervals):
+            assert posteriors.size == ts.num_mutations
+            lower_quantile = (1 - intervals) / 2
+            upper_quantile = 1 - lower_quantile
+            lower = np.full((len(position_map), intervals.size), np.nan)
+            upper = np.full((len(position_map), intervals.size), np.nan)
+            biallelic = np.bincount(ts.mutations_site, minlength=ts.num_sites) == 1
+            for t in ts.trees():
+                for m in t.mutations():
+                    pos = ts.sites_position[m.site]
+                    if m.edge != tskit.NULL and biallelic[m.site] and pos in position_map:
+                        i = position_map[pos]
+                        shape = posteriors["mean"][m.id] ** 2 / posteriors["variance"][m.id]
+                        rate = posteriors["mean"][m.id] / posteriors["variance"][m.id]
+                        distr = scipy.stats.gamma(shape, scale=1/rate)
+                        if shape > 1:
+                            lower[i] = 0.0
+                            upper[i] = distr.ppf(intervals)
+                        else:
+                            lower[i] = distr.ppf(lower_quantile)
+                            upper[i] = distr.ppf(upper_quantile)
+            return lower, upper
+
+        np.save(output.simulate_mutation_intervals, mutation_ci(simulate_trees, simulate_mutation_posteriors, interval_width))
+        np.save(output.infer_mutation_intervals, mutation_ci(infer_trees, infer_mutation_posteriors, interval_width))
+        np.save(output.mutation_frequency, mutation_frequency(true_trees)) 
+        np.save(output.mutation_age, mutation_age(true_trees))
+
+
+rule calculate:
+    input:
+        simulate_mutation_intervals = rules.mutations.output.simulate_mutation_intervals,
+        infer_mutation_intervals = rules.mutations.output.infer_mutation_intervals,
+        mutation_frequency = rules.mutations.output.mutation_frequency,
+        mutation_age = rules.mutations.output.mutation_age,
+    output:
+        simulate_mutation_coverage = os.path.join(TREES_DIR, "{model}.simulate.coverage.mutation.npy"),
+        infer_mutation_coverage = os.path.join(TREES_DIR, "{model}.infer.coverage.mutation.npy"),
+    log:
+        logfile = os.path.join(TREES_DIR, "{model}.calculate.log"),
+    params:
+        interval_width = INTERVAL_WIDTH,
+    run:
+        import tskit
+        import pickle
+
+        mutation_frequency, mutation_age = np.load(input.mutation_frequency), np.load(input.mutation_age)
+        mutation_valid = mutation_frequency != tskit.NULL
+        simulate_mutation_lower, simulate_mutation_upper = np.load(input.simulate_mutation_intervals)[:, mutation_valid]
+        infer_mutation_lower, infer_mutation_upper = np.load(input.infer_mutation_intervals)[:, mutation_valid]
+        mutation_frequency, mutation_age = mutation_frequency[mutation_valid], mutation_age[mutation_valid]
+        simulate_mutation_lower, simulate_mutation_upper = simulate_mutation_lower.T, simulate_mutation_upper.T
+        infer_mutation_lower, infer_mutation_upper = infer_mutation_lower.T, infer_mutation_upper.T
+
+        interval_width = np.array(params.interval_width)
+        simulate_mutation_coverage = np.full(interval_width.size, np.nan)
+        infer_mutation_coverage = np.full(interval_width.size, np.nan)
+        for j, width in enumerate(interval_width):
+            infer_mutation_coverage[j] = np.logical_and(
+                mutation_age > infer_mutation_lower[j], 
+                mutation_age < infer_mutation_upper[j],
+            ).sum() / mutation_age.size
+            simulate_mutation_coverage[j] = np.logical_and(
+                mutation_age > simulate_mutation_lower[j], 
+                mutation_age < simulate_mutation_upper[j],
+            ).sum() / mutation_age.size
+
+        np.save(output.simulate_mutation_coverage, simulate_mutation_coverage)
+        np.save(output.infer_mutation_coverage, infer_mutation_coverage)
+
+
+rule plot:
+    input:
+        infer_mutation_coverage = expand(rules.calculate.output.infer_mutation_coverage, model=MODEL_NAMES),
+        simulate_mutation_coverage = expand(rules.calculate.output.simulate_mutation_coverage, model=MODEL_NAMES),
+    output:
+        plot = rules.all.input.plot,
+    params:
+        interval_width = INTERVAL_WIDTH,
+    run:
+        import matplotlib.pyplot as plt
+        import pandas
+        import pickle
+
+        interval_width = np.array(params.interval_width)
+        rows, cols = 1, len(MODEL_NAMES)
+        fig, axs = plt.subplots(
+            rows, cols, 
+            figsize=(2 * cols + 2, 2 * rows + 1),
+            sharey="row", sharex=True,
+            constrained_layout=True,
+            squeeze=False,
+        )
+        for i, (mut_infr, mut_true, name) in enumerate(
+            zip(
+                input.infer_mutation_coverage, 
+                input.simulate_mutation_coverage, 
+                MODEL_NAMES,
+            )
+        ):
+            axs[0, i].plot(interval_width, np.load(mut_true), "-o", markersize=2, color="firebrick", label="true+tsdate")
+            axs[0, i].plot(interval_width, np.load(mut_infr), "-o", markersize=2, color="dodgerblue", label="tsinfer+tsdate")
+            axs[0, i].axline((0.5, 0.5), (0.6, 0.6), color="black", linestyle="dashed")
+            axs[0, i].set_title(name, family="monospace", size=8)
+            axs[0, i].set_xlim(0, 1)
+            axs[0, i].set_ylim(0, 1)
+
+        fig.supylabel("Posterior interval coverage", size=10)
+        fig.supxlabel("Expected interval coverage for mutation age", size=10)
+        fig.legend(
+            *axs[0, 0].get_legend_handles_labels(),
+            loc="outside upper center",
+            frameon=False,
+            ncol=2,
+        )
+        plt.savefig(output.plot)

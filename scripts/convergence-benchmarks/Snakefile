@@ -1,0 +1,119 @@
+"""
+Benchmark tsdate convergence as a function of sample size, on one of the
+realistic human chromosome simulations from Anderson-Trocme et al 2023
+(https://zenodo.org/records/7702392)
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import pickle
+
+configfile: "test-config.yaml"
+
+RNG = np.random.default_rng(int(config["random-seed"]))
+NUM_REPS = config["num-replicates"]
+MAX_MEM_MB = int(config["memory-per-job-gb"]) * 1000
+CHROM = "chrom_" + str(config["chromosome"])
+SAMPLE_SIZE_ARRAY = np.array(config["sample-size-grid"])
+SEED_ARRAY = RNG.integers(1, 2 ** 32 - 1, size=NUM_REPS)
+
+OUTPUT_PREFIX = config["output-prefix"]
+TREES_PATH = config["trees-dir"]
+
+EP_ITERATIONS = np.arange(config["max-ep-iterations"]) + 1
+EP_METRICS_PATH = (
+  f"{TREES_PATH}/convergence/{{ep_iterations}}."
+  f"{{rescaling_iterations}}.{{sample_size}}.{{seed}}.pkl"
+)
+
+
+rule all:
+    input:
+        csv = f"{OUTPUT_PREFIX}.csv",
+        plot = f"{OUTPUT_PREFIX}.pdf",
+
+
+rule fetch_trees:
+    params:
+        url = f"https://zenodo.org/records/7702392/files/simulated_{CHROM}.ts.tsz?download=1"
+    output: 
+        trees = f"{TREES_PATH}/{CHROM}.tsz"
+    shell: 
+        "wget -q -O {output.trees} {params.url}"
+
+
+rule subsample_trees:
+    input:
+        trees = rules.fetch_trees.output.trees,
+    output:
+        trees = f"{TREES_PATH}/subsample/{{sample_size}}.{{seed}}.tsz",
+    run:
+        import tszip
+        ts = tszip.load(input.trees)
+        seed = int(wildcards.seed)
+        sample_size = int(wildcards.sample_size)
+        rng = np.random.default_rng(seed)
+        samples = list(ts.samples())
+        subsample = rng.choice(samples, size=sample_size, replace=False)
+        ts = ts.simplify(subsample)
+        tszip.compress(ts, output.trees)
+
+
+rule run_tsdate:
+    input:
+        trees = rules.subsample_trees.output.trees,
+    output:
+        node_posteriors = EP_METRICS_PATH.removesuffix(".pkl") + ".node_posteriors.npy",
+        mutation_posteriors = EP_METRICS_PATH.removesuffix(".pkl") + ".mutation_posteriors.npy",
+        node_times = EP_METRICS_PATH.removesuffix(".pkl") + ".node_times.npy",
+        mutation_times = EP_METRICS_PATH.removesuffix(".pkl") + ".mutation_times.npy",
+    log:
+        logfile = EP_METRICS_PATH.removesuffix(".pkl") + ".log",
+    params:
+        rescaling_intervals = config.get("rescaling-intervals", 10000),
+        min_branch_length = config.get("min-branch-length", 1e-8),
+    script:
+        "scripts/run_tsdate.py"
+
+
+rule calculate_coverage:
+    input:
+        trees = rules.subsample_trees.output.trees,
+        node_times = rules.run_tsdate.output.node_times,
+        mutation_times = rules.run_tsdate.output.mutation_times,
+    output:
+        metrics = EP_METRICS_PATH,
+    log:
+        logfile = EP_METRICS_PATH.removesuffix(".pkl") + ".log",
+    script:
+        "scripts/calculate_coverage.py"
+
+
+rule extract_convergence_data:
+    input:
+        metrics = expand(
+          EP_METRICS_PATH,
+          seed=SEED_ARRAY, 
+          sample_size=SAMPLE_SIZE_ARRAY, 
+          ep_iterations=EP_ITERATIONS,
+          rescaling_iterations=config.get("default-rescaling-iterations", 3),
+        )
+    output:
+        csv = rules.all.input.csv,
+    run:
+        metrics = [pickle.load(open(f, "rb")) for f in input.metrics]
+        metrics = pd.DataFrame(metrics)
+        metrics.to_csv(output.csv, index=False)
+
+
+rule plot_convergence:
+    input:
+        csv = rules.extract_convergence_data.output.csv,
+    output:
+        plot = rules.all.input.plot,
+    params:
+        figsize = config.get("figure-size", [4, 3]),
+        dpi = config.get("figure-dpi", 300),
+    script:
+        "scripts/plot_convergence.py"
