@@ -1,0 +1,10 @@
+*.swp
+*.swo
+*.log
+debug*
+test.csv
+test.pdf
+full.csv
+full.pdf
+.snakemake/
+

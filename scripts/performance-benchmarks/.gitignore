@@ -1,0 +1,12 @@
+*.swp
+*.swo
+*.log
+debug*
+test.*.csv
+test.*.pdf
+full.*.csv
+full.*.pdf
+mem-profile-subprocess/
+.snakemake/
+METHODS
+

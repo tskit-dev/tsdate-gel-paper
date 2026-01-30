@@ -1,0 +1,12 @@
+.snakemake/
+*.log
+*.swp
+*.swo
+test*png
+test*pdf
+test*tex
+full*png
+full*pdf
+full*tex
+debug/
+debug.py

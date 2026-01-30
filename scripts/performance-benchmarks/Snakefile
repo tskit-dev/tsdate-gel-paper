@@ -1,0 +1,192 @@
+"""
+Benchmark variational-gamma runtime, memory footprint, and accuracy against
+inside-outside and POLEGON as a function of sample size, on one of the
+realistic human chromosome simulations from Anderson-Trocme et al 2023
+(https://zenodo.org/records/7702392)
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import pickle
+
+configfile: "test-config.yaml"
+
+RNG = np.random.default_rng(int(config["random-seed"]))
+NUM_REPS = config["num-replicates"]
+MAX_MEM_MB = int(config["memory-per-job-gb"]) * 1000
+CHROM = "chrom_" + str(config["chromosome"])
+SAMPLE_SIZE_ARRAY = np.array(config["sample-size-grid"])
+SEED_ARRAY = RNG.integers(1, 2 ** 32 - 1, size=NUM_REPS)
+
+OUTPUT_PREFIX = config["output-prefix"]
+TREES_PATH = config["trees-dir"]
+
+ALGORITHMS = ["variational_gamma", "inside_outside", "polegon"]
+PROFILE = ["walltime", "peak_memory"]
+METRICS_PATH = f"{TREES_PATH}/{{profile}}/{{algorithm}}.{{sample_size}}.{{seed}}.pkl"
+
+
+rule all:
+    input:
+        benchmark_csv = f"{OUTPUT_PREFIX}.benchmark.csv",
+        benchmark_plot = f"{OUTPUT_PREFIX}.benchmark.pdf",
+
+
+rule fetch_trees:
+    params:
+        url = f"https://zenodo.org/records/7702392/files/simulated_{CHROM}.ts.tsz?download=1"
+    output: 
+        trees = f"{TREES_PATH}/{CHROM}.tsz"
+    shell: 
+        "wget -q -O {output.trees} {params.url}"
+
+
+rule fetch_polegon:
+    params:
+        binary_url = (
+            "https://github.com/YunDeng98/POLEGON/raw/"
+            "0c088b339a0636edde1cf569f0d7c4eea6a07af5/"
+            "POLEGON/POLEGON/polegon"
+        ),
+        wrapper_url = (
+            "https://github.com/YunDeng98/POLEGON/raw/"
+            "0c088b339a0636edde1cf569f0d7c4eea6a07af5/"
+            "POLEGON/POLEGON/polegon_master"
+        ),
+    output:
+        binary = f"{TREES_PATH}/polegon",
+        wrapper = f"{TREES_PATH}/polegon_master",
+    shell: 
+        """
+        wget -q -O {output.binary} {params.binary_url}
+        wget -q -O {output.wrapper} {params.wrapper_url}
+        chmod +x {output.binary}
+        """
+
+
+rule subsample_trees:
+    input:
+        trees = rules.fetch_trees.output.trees,
+    output:
+        trees = f"{TREES_PATH}/subsample/{{sample_size}}.{{seed}}.tsz",
+        nodes_time = f"{TREES_PATH}/subsample/{{sample_size}}.{{seed}}.nodes_time.npy",
+    params:
+        reset_nodes_time = config.get("reset-nodes-time", True),
+        trim_sequence_to = config.get("trim-sequence-to", None),
+    run:
+        import tszip
+        ts = tszip.load(input.trees)
+        seed = int(wildcards.seed)
+        sample_size = int(wildcards.sample_size)
+        rng = np.random.default_rng(seed)
+        samples = list(ts.samples())
+        subsample = rng.choice(samples, size=sample_size, replace=False)
+        ts = ts.simplify(subsample)
+        if params.trim_sequence_to is not None:
+            ts = ts.keep_intervals([params.trim_sequence_to]).trim()
+        np.save(output.nodes_time, ts.nodes_time)
+        if params.reset_nodes_time:
+            # set node times to something tsinfer-like, so that true
+            # ages are not used as the initial state in MCMC
+            nodes_time = np.zeros(ts.num_nodes)
+            for e in ts.edges():
+                if nodes_time[e.parent] - nodes_time[e.child] < 1:
+                    nodes_time[e.parent] = nodes_time[e.child] + 1
+            nodes_time /= nodes_time.max()
+            tab = ts.dump_tables()
+            tab.nodes.time = nodes_time
+            tab.sort()
+            tab.build_index()
+            tab.compute_mutation_times()
+            ts = tab.tree_sequence()
+        tszip.compress(ts, output.trees)
+
+               
+rule benchmark_tsdate:
+    input:
+        trees = rules.subsample_trees.output.trees,
+        true_nodes_time = rules.subsample_trees.output.nodes_time,
+    output:
+        metrics = METRICS_PATH,
+        infr_nodes_time = METRICS_PATH.removesuffix(".pkl") + ".nodes_time.npy",
+    log:
+        logfile = METRICS_PATH.removesuffix(".pkl") + ".log",
+    wildcard_constraints:
+        algorithm = "variational_gamma"
+    params:
+        rescaling_intervals = config.get("rescaling-intervals", 10000),
+        rescaling_iterations = config.get("rescaling-iterations", 3),
+        ep_iterations = config.get("ep-iterations", 10),
+    script:
+        "scripts/benchmark_tsdate.py"
+
+
+rule benchmark_inout:
+    input:
+        trees = rules.subsample_trees.output.trees,
+        true_nodes_time = rules.subsample_trees.output.nodes_time,
+    output:
+        metrics = METRICS_PATH,
+        infr_nodes_time = METRICS_PATH.removesuffix(".pkl") + ".nodes_time.npy",
+    log:
+        logfile = METRICS_PATH.removesuffix(".pkl") + ".log",
+    wildcard_constraints:
+        algorithm = "inside_outside"
+    resources:
+        mem_mb = MAX_MEM_MB,
+    script:
+        "scripts/benchmark_tsdate.py"
+
+
+rule benchmark_polegon:
+    input:
+        trees = rules.subsample_trees.output.trees,
+        polegon = rules.fetch_polegon.output.binary,
+        polegon_master = rules.fetch_polegon.output.wrapper,
+        true_nodes_time = rules.subsample_trees.output.nodes_time,
+    output:
+        metrics = METRICS_PATH,
+        infr_nodes_time = METRICS_PATH.removesuffix(".pkl") + ".nodes_time.npy",
+    log:
+        logfile = METRICS_PATH.removesuffix(".pkl") + ".log",
+    wildcard_constraints:
+        algorithm = "polegon"
+    params:
+        # defaults from 'polegon_master'
+        num_samples = config.get("polegon-num-samples", 100),
+        burn_in = config.get("polegon-burn-in", 100),
+        scaling_rep = config.get("polegon-scaling-rep", 3),
+        thin = config.get("polegon-thin", 10),
+        max_step = config.get("polegon-max-step", 10),
+    script:
+        "scripts/benchmark_polegon.py"
+
+
+rule extract_benchmark_data:
+    input:
+        metrics = expand(
+          METRICS_PATH,
+          seed=SEED_ARRAY, 
+          sample_size=SAMPLE_SIZE_ARRAY, 
+          algorithm=ALGORITHMS, 
+          profile=PROFILE,
+        )
+    output:
+        csv = rules.all.input.benchmark_csv,
+    run:
+        metrics = [pickle.load(open(f, "rb")) for f in input.metrics]
+        metrics = pd.DataFrame(metrics)
+        metrics.to_csv(output.csv, index=False)
+
+
+rule plot_benchmarks:
+    input:
+        csv = rules.extract_benchmark_data.output.csv,
+    output:
+        plot = rules.all.input.benchmark_plot,
+    params:
+        figsize = config.get("figure-size", [10, 3]),
+        dpi = config.get("figure-dpi", 300),
+    script:
+        "scripts/plot_benchmarks.py"

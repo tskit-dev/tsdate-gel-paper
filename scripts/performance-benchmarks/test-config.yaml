@@ -1,0 +1,13 @@
+output-prefix: "test"
+trees-dir: "/sietch_colab/data_share/natep/gel-dating-paper/polegon-benchmark/test"
+random-seed: 1024
+#trim-sequence-to: [2.0e+7, 3.0e+7]
+memory-per-job-gb: 10
+chromosome: 22
+sample-size-grid: [10, 100, 1000]
+num-replicates: 3
+max-ep-iterations: 10
+max-rescaling-iterations: 10
+default-resources:
+    mem_mb: 100000
+
