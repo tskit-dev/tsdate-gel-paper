@@ -15,6 +15,11 @@ Publicly shareable code and plot data for the "Tracing the evolutionary historie
 - The ``data`` directory contains the data needed to make the plots, and ``figures`` is where
   the plots are written.
 
+## Archive
+
+A snapshot of this repository, including the copy of the Snakemake workflow, is archived on
+Zenodo: https://doi.org/10.5281/zenodo.23142020
+
 ## Data
 
 - Allele ages for non-rare variants (DAC > 20) in the Genomics England data: https://doi.org/10.5281/zenodo.23038476

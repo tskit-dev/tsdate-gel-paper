@@ -11,12 +11,12 @@ Rendered HTML reports for each section are included in this directory (download 
 - [GEL, Summary statistics](gel-summary_stats.html) (`gel-summary_stats.Rmd`; Figs. S11–S17)
 - [GEL, Allele ages and ancestral diversity](gel-ages_ancestry.html) (`gel-ages_ancestry.Rmd`; Figs. S18–S20)
 - [GEL, Allele ages and negative selection](gel-ages_negselection.html) (`gel-ages_negselection.Rmd`; ED Figs. 8–9, Fig. S21)
-- [GEL, Allele ages of clinically classified mutations](gel-ages_clinical.html) (`gel-ages_clinical.Rmd`; Figs. S22–S23)
+- [GEL, Allele ages of clinically classified mutations](gel-ages_clinical.html) (`gel-ages_clinical.Rmd`; Figs. S22–S23, Tables S5–S6)
 
 There are also reports for generating annotated parquet dataframes from inferred ARGs (per chromosome), produced by `gel-ts_df.Rmd`.
 These are stored in the `chrom_reports/` subdirectory.
 
-The `data/` subdirectory contains summary outputs that have been exported from the Research Environment: the logistic models of age by score bin (`*_age_z_logistic.csv`, written by `gel-ages_negselection.Rmd`; Tables S9–S12), and the Relate age summaries (`relate_means.csv`, written by `gel-summary_stats.Rmd`).
+The `data/` subdirectory contains summary outputs that have been exported from the Research Environment: the logistic models of age by score bin (`*_age_z_logistic.csv`, written by `gel-ages_negselection.Rmd`; Tables S7–S9 and S12), and the Relate age summaries (`relate_means.csv`, written by `gel-summary_stats.Rmd`).
 
 ## Data access
 
