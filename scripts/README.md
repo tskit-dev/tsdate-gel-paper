@@ -2,13 +2,13 @@ This folder contains all the code used to generate figures in the manuscript tha
 
 # Requirements
 
-To run code in this folder, you will need a `python` 3.9+ installation. If you are on Windows, please use the Windows Subsystem for Linux (WSL) to run commands. The required packages can be installed with
+To run code in this folder, you will need a `python` 3.11+ installation. If you are on Windows, please use the Windows Subsystem for Linux (WSL) to run commands. The required packages can be installed with
 
 ```
 python -m pip install -r requirements.txt
 ```
 
-An R installation is also needed to produce one table (Table S8) as discussed below. Unless otherwise specified, all paths below are relative to the `scripts` directory.
+An R installation is also needed to produce one table (Table S11) as discussed below. Unless otherwise specified, all paths below are relative to the `scripts` directory.
 
 # Snakemake pipelines
 
@@ -19,7 +19,7 @@ Each pipeline has its own folder in this directory, with its own conda `environm
 * `uncertainty-benchmarks`: Analyses the calibration of `tsdate` VG posteriors (ED Fig. 3).
 * `selection-benchmark`: Forward simulations (SLiM, via stdpopsim) with direct and background selection, evaluating dating accuracy for singletons under selection, and how informative variant ages are about deleteriousness as a function of sample admixture and allele frequency (ED Figs. 4, 7 and 10).
 * `convergence-benchmarks`: Uses simulated data to evaluate `tsdate` convergence (Fig. S1).
-* `tgp_comparison`: Compares allele age estimates from five methods on chr20 of the 1KGP data (Fig. S9). Requires ~18 GB of data obtained from various sources; the `bcftools` script used to extract singletons from the unphased VCFs is not included. Please contact us if you'd like to run this analysis and we would be happy to assist.
+* `tgp_comparison`: Compares allele age estimates from five methods on chr20 of the 1KGP data (Fig. S9). Requires ~18 GB of data obtained from various sources; the `bcftools` script used to extract singletons from the unphased VCFs is not included. Please contact us if you'd like to run this analysis and we would be happy to assist. Unlike the other pipelines, this one has a single `config.yaml` (data and results directories are relative to the pipeline folder) and no `environment.yaml`: it uses the packages in `requirements.txt` plus `snakemake`, `pyfaidx`, `pyreadr`, `click` and `tqdm`. The other methods are not run; their published age estimates are read from the data directory.
 
 The pipelines write their plots inside their own folder. These correspond to the figures in the paper as follows:
 
@@ -35,7 +35,7 @@ The pipelines write their plots inside their own folder. These correspond to the
 
 # Makefile for sampling simulation
 
-One Makefile was created (`base_dir/makefiles/sampling_sim.mk`) to produce the large intermediate data files that are needed to make Table S8 and ED Fig. 6. To run it from the base directory:
+One Makefile was created (`base_dir/makefiles/sampling_sim.mk`) to produce the large intermediate data files that are needed to make Table S11 and ED Fig. 6. To run it from the base directory:
 
 ```
 cd tools && make #from base directory
@@ -89,5 +89,5 @@ These can be run without any arguments.
 * `phasing_benchmark_doubleton.py`: Accuracy and coverage of doubleton ages across the same treatments (indirect effect of singleton phasing on deeper nodes) (Fig. S3).
 * `sequence_length_accuracy_benchmark.py` Tests the bias in `tsdate` age estimates due to short sequence length (Fig. S10)
 * `algorithm_schematic_supp.py`: Produces the additional schematic in Fig. S24.
-* `simulation_selection_analysis.r` Summarises results of various linear models comparing mutation age vs allele frequency (Table S8). Requires R to be installed.
-* `contig_table.py`: Prints the summary tables of GEL inference regions (Table S2), timing (Table S3) and statistics (Table S4), and of 1KGP inference statistics (Table S7).
+* `simulation_selection_analysis.r` Summarises results of various linear models comparing mutation age vs allele frequency (Table S11). Requires R to be installed.
+* `contig_table.py`: Prints the summary tables of GEL inference regions (Table S2), timing (Table S3) and statistics (Table S4), and of 1KGP inference statistics (Table S10).
