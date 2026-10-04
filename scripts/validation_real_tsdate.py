@@ -48,7 +48,7 @@ if __name__ == "__main__":
         help=(
             'The inferred tree sequence filename format, with {chrom} as a placeholder'
         ),
-        default="data/tgp/all-{chrom}-filterNton23-truncate-0-0-0-mm0-post-processed-simplified-SDN-singletons-dated-metadata.trees.tsz"
+        default="data/tgp/1kgp_{chrom}.trees.tsz"
     )
     argparser.add_argument(
         '--chromosomes', "-c",

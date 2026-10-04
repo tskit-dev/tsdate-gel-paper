@@ -1,6 +1,8 @@
-For the moment, download the following files from https://drive.google.com/drive/folders/1vn5xMlBBXTB-_sosX9LpaQ_45E36UVoa
-This has not been automated as we will eventually provide scripts to generate these inferences
+# 1000 Genomes Project inferred ARGs
 
-* all-chr20p-filterNton23-truncate-0-0-0-mm0-post-processed-simplified-SDN-singletons-dated-metadata.trees.tsz
-* all-chr20q-filterNton23-truncate-0-0-0-mm0-post-processed-simplified-SDN-singletons-dated-metadata.trees.tsz
-* all-chr17q45M~83M-filterNton23-truncate-0-0-0-mm0-post-processed-simplified-SDN-singletons-dated-metadata.trees.tsz
+Dated tree sequences (tsinfer + tsdate, singletons added) for chromosomes 17 and 20
+of the 1000 Genomes Project high-coverage dataset (3,202 individuals), as described
+in the paper's Methods.
+
+Download the `.trees.tsz` files from the Zenodo record
+(https://doi.org/10.5281/zenodo.23086785) and put them in this directory.

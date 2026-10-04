@@ -1,0 +1,55 @@
+output-prefix: "admix-full"
+trees-dir: "/sietch_colab/data_share/natep/gel-dating-paper/selection-benchmark/admix-full"
+random-seed: 1024
+
+# tsdate
+ep-iterations: 10
+rescaling-iterations: 3
+rescaling-intervals: 10000
+min-branch-length: 1.0e-8
+threads-per-job: 40
+
+# forward simulation (SLiM)
+base-model: "AmericanAdmixture_4B18"   # catalog 4-pop admixture (AFR/EUR/ASIA/ADMIX, pulse @ 12 gen)
+dfe: "Gamma_K17"
+mutation-rate: 2.36e-8                  # AmericanAdmixture_4B18 mutation rate
+slim-scaling: 1                         # Q=1: recent (12-gen) admixture is undistorted (scaling crushes it)
+slim-burn-in: 5                         # x Ne (reduced from default 10; SFS still equilibrates)
+slim-path: "/home/natep/miniconda3/bin/slim"
+
+# cohort design
+reference-pop: "EUR"                    # frequency baseline (DAC) + pure-EUR control
+ancestry-panels: ["AFR", "EUR", "ASIA"] # supervised-ancestry calibration panels (q-vector column order)
+n-reference: 15000                      # EUR reference-cohort diploids (DAC baseline)
+n-control: 50                           # pure-EUR control targets (non-EUR = 0)
+n-admix-pool: 10000                     # oversampled ADMIX pool to subsample the gradient from
+n-panel: 200                            # AFR/ASIA panel diploids (ancestry calibration + source-pure group)
+n-eur-calib: 1000                       # EUR diploids used for ancestry-freq calibration (subset of reference)
+
+# ancestry-gradient grid (non-EUR ancestry)
+grid-admix: [0.2, 0.4, 0.6, 0.8]        # interior grid points, sourced from measured-ancestry ADMIX
+n-per-group: 50                         # target diploids per group
+n-candidates: 150                       # closest-N ADMIX per grid point considered before thinning
+grid-window: 0.06                       # max |non-EUR - target| to qualify as a candidate
+source-pure-counts:                     # non-EUR = 1.0 group: AFR:ASIA in the admixture ratio (1:3)
+    AFR: 12
+    ASIA: 38
+n-sites-ancestry: 30000                 # sites subsampled for the supervised ancestry fit
+
+# relatedness thinning: pick the least-related n-per-group via recent-IBD (true ARG,
+# structure-free). ADMIX is founded only 12 gen ago, so close kin are non-trivial.
+ibd-max-time: 6.0                       # MRCA cutoff (gen); < admixture (12) -> pedigree kin only
+ibd-min-span: 1000000                   # min IBD segment span (bp)
+
+# analysis / summary-plot filters
+max-freq: 0.01
+age-filter: 1000.0
+del-threshold: 1.0e-3
+
+replicates: 3
+
+contig:
+    chromosome: "chr17"
+    genetic_map: "HapMapII_GRCh38"
+    left: 42.0e+6
+    right: 82.0e+6        # full 40 Mb window

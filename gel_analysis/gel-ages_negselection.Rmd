@@ -46,7 +46,6 @@ use_virtualenv("/opt/python_env", required = TRUE)
 ```
 
 # Parameters
-
 ```{r, message = FALSE}
 ## Python functions for reticulate
 source_python("functions/gel-funcs.py")
@@ -58,7 +57,6 @@ set.seed(31)
 ```
 
 File paths from config...
-
 ```{r}
 config <- yaml::read_yaml("config/config.yaml")
 
@@ -77,19 +75,17 @@ paths <- Filter(Negate(is.null), paths)
 ```
 
 Paths and information from the dated trees
-
 ```{r}
 ## List of trees (with singletons included)
 ts_tsv <- params$ts_tsv
+#ts_tsv <- "/pgen_int_work/BRS/dd/sam/projects/gel-dating-paper/trees_singletons_july25.tsv"
 trees_list <- read_tsv(ts_tsv)
 ts_dir <- paths$ts_dir
 ```
 
 # Data
-
 We read in the relevant data from chromosomes
-- Generated using gel_ts-df.Rmd
-
+- Generated using `gel_ts-df.Rmd`
 ```{r, message = FALSE}
 # Extract relevant columns from the ts_df for all chromosomes
 selected_columns <- c(
@@ -114,7 +110,7 @@ Lazy loading for filtering etc.
 We exclude:
 - Mutations below the unconstrained root
 - Mutations without any dates in the tree sequences
-See outputs of gel-summary_stats.Rmd for numbers of these specific mutations
+See outputs of `gel-summary_stats.Rmd` for numbers of these specific mutations
 ```{r}
 ts_lf_merge <- scan_parquet_polars(file.path(paths$output_dir, "all-chr*-df.parquet")) |>
   dplyr::select(all_of(selected_columns)) |>
@@ -165,6 +161,219 @@ z_normalise(
     )
 ```
 
+
+## Constraint Z-score plot
+gnomADv3.1 released Z-scores showing mutational constraint across chromosomes
+We can take a look at if there is any enrichment/depletion of allele frequency / allele age outliers (Z-scores) within constraint Z-score bins.
+
+```{r}
+## takes a while, checkpoint
+checkpoint_gnocchi_regress <- paste0(
+  paths$output_dir,
+  "checkpoints/all-chr17-gnocchi_z-regression.tsv.gz"
+)
+
+cat("Gnocchi checkpoint:", checkpoint_gnocchi_regress, "\n")
+
+if (file.exists(checkpoint_gnocchi_regress)) {
+
+  cat("Loading existing Gnocchi regression checkpoint\n")
+
+  gnocchi_logistic_test_between_z <- data.table::fread(
+    checkpoint_gnocchi_regress
+  )
+
+} else {
+
+  cat("Checkpoint not found; running Gnocchi regressions\n")
+
+  gnocchi_logistic_test_between_z <-
+    outlier_logistic_loop_wrapper(
+      df = ts_lf_merge %>%
+        filter(chromosome == "chr17"),
+      outcome_col = "gnocchi_z",
+      outcome_vec = c(
+        "<n4", "n3-n4", "n2-n3", "n1-n2",
+        "0-n1", "0-1", "1-2", "2-3", "3-4", ">=4"
+      ),
+      outlier_thresh_vec = c(-Inf, 0, 1, 2, 3, 4, Inf),
+      outlier_col = "time_z",
+      group_vals = 1:max_ac_count(
+        ts_lf_merge,
+        AF_thresh = 0.001
+      ),
+      group_col = "AC_ts",
+      direction = "between",
+      correct_groups = FALSE,
+      group_as_factor = FALSE
+    )
+
+  data.table::fwrite(
+    gnocchi_logistic_test_between_z,
+    checkpoint_gnocchi_regress,
+    sep = "\t"
+  )
+}
+
+gnocchi_logistic_test_between_z %<>%
+  mutate(
+    outlier_score = gsub(
+      " - ",
+      " to ",
+      outlier_score
+    ),
+    outlier_score = case_when(
+      outlier_score == "-Inf to 0" ~ "< 0",
+      outlier_score == "4 to Inf" ~ "> 4",
+      TRUE ~ outlier_score
+    )
+  )
+```
+
+```{r}
+cat("Gnocchi results dimensions:",
+    nrow(gnocchi_logistic_test_between_z),
+    "x",
+    ncol(gnocchi_logistic_test_between_z),
+    "\n")
+
+print(names(gnocchi_logistic_test_between_z))
+```
+
+```{r}
+gnocchi_supp_table <- create_outlier_logistic_supp_table(
+  test_results = gnocchi_logistic_test_between_z,
+
+  source_df = ts_lf_merge %>%
+    as_tibble() %>%
+    filter(chromosome == "chr17"),
+
+  csv_file = "data/gnocchi_age_z_logistic.csv",
+
+  outcome_col = "gnocchi_z",
+
+  outcome_vec = c(
+    "<n4",
+    "n3-n4",
+    "n2-n3",
+    "n1-n2",
+    "0-n1",
+    "0-1",
+    "1-2",
+    "2-3",
+    "3-4",
+    ">=4"
+  ),
+
+  outlier_col = "time_z",
+  outlier_thresh_vec = c(-Inf, 0, 1, 2, 3, 4, Inf),
+
+  group_col = "AC_ts",
+  group_vals = 1:max_ac_count(ts_lf_merge, AF_thresh = 0.001),
+
+  direction = "between",
+
+  outlier_label = "Ultra-rare (DAF < 0.1%) mutation frequency-controlled age Z-score",
+  outcome_label = "Gnocchi constraint category"
+)
+```
+
+```{r}
+order_constraint <- c("<n4", "n3-n4", "n2-n3", "n1-n2", "0-n1", "0-1", "1-2", "2-3", "3-4", ">=4")
+gnocchi_z_plot <- gnocchi_logistic_test_between_z %>%
+enrichment_depletion_plot(
+  group_col = "gnocchi_z",
+  outlier_scores = unique(gnocchi_logistic_test_between_z$outlier_score),
+  group_vals = order_constraint
+) +
+scale_fill_viridis(option = "A", discrete = TRUE) +
+scale_color_viridis(option = "A", discrete = TRUE) +
+labs(
+  x = "Frequency-controlled age z-score bin",
+  y = "Relative P(class membership)"
+) +
+coord_cartesian(ylim = c(-0.4, 0.4)) +
+ggtitle("GEL DAF < 0.1%") +
+theme(
+    plot.title = element_text(size = rel(0.8)),  # Match axis text size
+    axis.text = element_text(size = rel(0.8))    # Adjust axis text size if needed
+  )
+```
+
+Constraint Z scores
+```{r}
+#### gnocchi constraint
+constraint_gnocchi <- fread(
+    file.path(paste0(paths$output,"all-chr17-gnocchi_constraint.tsv.gz"))
+  ) %>%
+  filter(
+    !(start > 18276569 & end < 26718757)
+  )
+```
+
+```{r}
+gnocchi_plot_constraint <- constraint_gnocchi %>%
+  mutate(
+    ymax = 1, ymin = -1,
+    gnocchi_z = factor(gnocchi_z, levels = order_constraint)
+  ) %>%
+  ggplot() +
+  theme_bw(base_size = 20) +
+  geom_rect(
+    aes(xmin = start/1e6, xmax = end/1e6,
+        ymin = ymin, ymax = ymax,
+        colour = gnocchi_z, fill = gnocchi_z),
+    alpha = 0.75
+  ) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "A", discrete = TRUE) +
+  scale_color_viridis(option = "A", discrete = TRUE) +
+  labs(
+    x = "Position (Mb)\nChromosome 17",
+    fill   = "gnocchi constraint class (z-score bin)",
+    colour = "gnocchi constraint class (z-score bin)"
+  ) +
+  guides(
+    fill = guide_legend(
+      title.position = "top",
+      title.hjust    = 0.5,
+      nrow           = 1,
+      label = FALSE,
+      keywidth  = unit(25, "pt"),
+      keyheight = unit(25, "pt")
+    ),
+    colour = "none"
+  ) +
+  theme(
+    legend.position     = "top",
+    legend.box          = "horizontal",
+    legend.title.align  = 0.5,
+    legend.spacing.x     = unit(3, "pt"),
+    panel.grid          = element_blank(),
+    axis.text.y         = element_blank(),
+    axis.title.y        = element_blank(),
+    axis.ticks.y        = element_blank()
+  ) +
+  geom_vline(xintercept = c(18276569, 26718757)/1e6, linewidth = 0.5)
+```
+
+```{r, fig.width = 10, fig.height = 6}
+gnocchi_z_score_fig <- ggarrange(
+  ggarrange(NULL, gnocchi_plot_constraint, nrow = 1, widths = c(0.07, 1)),
+  NULL,
+  gnocchi_z_plot,
+  ncol = 1,
+  heights = c(0.65, 0.05, 1)
+)
+gnocchi_z_score_fig
+```
+
+Save to PDF for paper
+```{r}
+ggsave(paste0(paths$plots_dir, "tmp_gel_constraint_gnocchi_figure_toedit.pdf"), gnocchi_z_score_fig, width = 12, height = 9)
+```
+
 Missense restricted (smaller) tibble
 ```{r}
 ts_df_missense <- ts_lf_merge %>%
@@ -176,7 +385,6 @@ ts_df_missense <- ts_lf_merge %>%
 - AlphaMissense categories (singletons + ur)
 - PrimateAI-3D categories (singletons + ur)
 - PanelApp mode of inheritance categories (singletons + ur)
-
 ```{r, message= FALSE}
 summarise_block <- function(df, group_var) {
   df %>%
@@ -245,6 +453,176 @@ knitr::kable(stats_tbl)
 ```
 We'll later exclude those small number of mutations with BOTH monoallelic (domiant) & biallelic (recessive) inheritance
 and those with NA (probably a bug)
+
+## ECDF and AUROC plots by AC across classes
+### AlphaMissense
+Define some plotting colours etc.
+```{r}
+am_categories <- c(
+  "Likely benign",
+  "Ambiguous",
+  "Likely pathogenic"
+)
+
+am_colors <- c(
+  "Likely benign" = "#78B7C5",
+  "Ambiguous" = "#EBCC2A",
+  "Likely pathogenic" = "#EF5703"
+)
+```
+
+Plot ECDF difference per AlphaMissense class stratified by AC 1-11
+```{r}
+p_am_delta_by_ac <- ecdf_difference_by_ac_plot(
+  df = ts_df_missense,
+  time_col = "mean_time",
+  group_col = "AM_pred",
+  ac_col = "AC_ts",
+  ac_vals = 1:11,
+  group_vals = am_categories,
+  reference_group = "Likely benign",
+  log10 = TRUE,
+  x_limits = c(1, 100000),
+  colors = am_colors,
+  min_n = 20
+) + 
+theme_bw() +
+theme(
+  axis.text.x = element_text(size = 6),
+  legend.position = "top",
+  strip.background = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.grid.major = element_blank()
+  ) + coord_cartesian(ylim = c(-0.05, 0.15)) +
+  labs(
+    y = "Difference in ECDF\nvs Likely benign"
+  )
+```
+
+We can then summarise this pattern using AUROC
+```{r}
+p_am_ac_line <- ecdf_difference_ac_line_plot(
+  df = ts_df_missense,
+  time_col = "mean_time",
+  group_col = "AM_pred",
+  ac_col = "AC_ts",
+  ac_vals = 1:15,
+  group_vals = am_categories,
+  reference_group = "Likely benign",
+  log10 = TRUE,
+  min_n = 100,
+  metric = "auroc",
+  trend_method = "lm",
+  legend_title = "AlphaMissense class",
+  show_se = FALSE,
+  return_data = FALSE,
+  colors = am_colors
+) + coord_cartesian(ylim = c(0.46, 0.62)) + 
+labs(x = "Derived allele count", y = "AUROC\nP(class younger than likely benign)")
+```
+
+### PanelApp
+```{r}
+ts_df_missense <- ts_df_missense %>%
+  mutate(
+    panel_app_moi_name = case_when(
+      panel_app_moi == "Unknown" ~ "None",
+      panel_app_moi == "BIALLELIC" ~ "Recessive",
+      panel_app_moi == "MONOALLELIC" ~ "Dominant"
+    )
+  )
+```
+
+NEW: Density and differences by AC
+```{r}
+pa_categories <- c(
+  "None",
+  "Recessive",
+  "Dominant"
+)
+
+pa_colors <- c(
+  "None" = "grey80",
+  "Recessive" = "#238b45",
+  "Dominant" = "#74c476"
+)
+```
+
+```{r}
+p_pa_delta_by_ac <- ecdf_difference_by_ac_plot(
+  df = ts_df_missense,
+  time_col = "mean_time",
+  group_col = "panel_app_moi_name",
+  ac_col = "AC_ts",
+  ac_vals = 1:11,
+  legend_name = "PanelApp inheritance class",
+  group_vals = pa_categories,
+  reference_group = "None",
+  log10 = TRUE,
+  x_limits = c(1, 100000),
+  colors = pa_colors,
+  min_n = 20
+) + 
+theme_bw() +
+theme(
+  axis.text.x = element_text(size = 6),
+  strip.background = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.grid.major = element_blank(),
+  legend.position = "top",
+  ) + coord_cartesian(ylim = c(-0.05, 0.15)) +
+  labs(
+    y = "Difference in ECDF\nvs None"
+  )
+```
+
+```{r}
+p_pa_ac_line <- ecdf_difference_ac_line_plot(
+  df = ts_df_missense,
+  time_col = "mean_time",
+  group_col = "panel_app_moi_name",
+  ac_col = "AC_ts",
+  ac_vals = 1:15,
+  group_vals = pa_categories,
+  reference_group = "None",
+  log10 = TRUE,
+  min_n = 100,
+  metric = "auroc",
+  trend_method = "lm",
+  show_se = FALSE,
+  legend_title = "PanelApp inheritance class", 
+  colors = pa_colors,
+  return_data = FALSE
+) + coord_cartesian(ylim = c(0.46, 0.62)) +
+labs(x = "Derived allele count", y = "AUROC\nP(class younger than None)")
+```
+
+Combine the plots together for publication
+```{r, fig.width = 10, fig.height = 7}
+comb_plot <- cowplot::plot_grid(
+  p_am_delta_by_ac,
+  p_pa_delta_by_ac,
+  ncol = 1, labels = c("a", "b")
+)
+comb_plot
+```
+
+```{r}
+ggsave("../figures/am_pa-ecdf-by-dac.pdf", comb_plot, width = 10, height = 7)
+```
+
+```{r, fig.width = 4, fig.height = 7}
+comb_plot <- cowplot::plot_grid(
+  p_am_ac_line,
+  p_pa_ac_line,
+  ncol = 1, labels = c("a", "b")
+)
+comb_plot
+```
+
+```{r}
+ggsave("../figures/am_pa-auroc-by-dac.pdf", comb_plot, width = 4, height = 7)
+```
 
 ## Singleton missense plots across classes
 - Log scaled ages by classes (box+whiskers)
@@ -449,6 +827,32 @@ mutate(outlier_score = gsub(" - ", " to ", outlier_score),
        )) 
 ```
 
+```{r}
+am_supp_table <- create_outlier_logistic_supp_table(
+  test_results = am_logistic_test_z,
+  source_df = ts_df_missense,
+  csv_file = "data/alphamissense_age_z_logistic.csv",
+
+  outcome_col = "AM_pred",
+  outcome_vec = c(
+    "Likely benign",
+    "Ambiguous",
+    "Likely pathogenic"
+  ),
+
+  outlier_col = "time_z",
+  outlier_thresh_vec = c(-Inf, -2, -1, 0, 1, 2, 3, 4, Inf),
+
+  group_col = "AC_ts",
+  group_vals = 1:max_ac_count(ts_lf_merge, AF_thresh = 0.001),
+
+  direction = "between",
+
+  outcome_label = "AlphaMissense class",
+  outlier_label = "Ultra-rare (DAF < 0.1%) missense mutation frequency-controlled age Z-score"
+)
+```
+
 Plot...
 ```{r}
 am_zcat_plot <- am_logistic_test_z %>%
@@ -490,7 +894,7 @@ Run the logistic regression loop
 ```{r}
 moi_logistic_test_z <-
 outlier_logistic_loop_wrapper(
-   ts_df_missense,
+   ts_df_missense %>%
     filter(panel_app_moi %in% c("BIALLELIC", "Unknown", "MONOALLELIC")),
   outcome_col = "panel_app_moi",
   outcome_vec = c("BIALLELIC", "Unknown", "MONOALLELIC"),
@@ -510,6 +914,38 @@ mutate(outlier_score = gsub(" - ", " to ", outlier_score),
         outlier_score == "4 to Inf" ~ "> 4",
         TRUE ~ outlier_score
        ))
+```
+
+```{r}
+moi_supp_table <- create_outlier_logistic_supp_table(
+  test_results = moi_logistic_test_z,
+
+  source_df = ts_df_missense %>%
+    filter(
+      panel_app_moi %in%
+        c("BIALLELIC", "Unknown", "MONOALLELIC")
+    ),
+
+  csv_file = "data/moi_age_z_logistic.csv",
+
+  outcome_col = "panel_app_moi",
+  outcome_vec = c(
+    "BIALLELIC",
+    "Unknown",
+    "MONOALLELIC"
+  ),
+
+  outlier_col = "time_z",
+  outlier_thresh_vec = c(-Inf, -2, -1, 0, 1, 2, 3, 4, Inf),
+
+  group_col = "AC_ts",
+  group_vals = 1:max_ac_count(ts_lf_merge, AF_thresh = 0.001),
+
+  direction = "between",
+  
+  outlier_label = "Ultra-rare (DAF < 0.1%) missense mutation frequency-controlled age Z-score",
+  outcome_label = "Mode of inheritance class"
+)
 ```
 
 Plot...
@@ -570,6 +1006,35 @@ mutate(outlier_score = gsub(" - ", " to ", outlier_score),
        )) 
 ```
 
+```{r}
+pai3d_supp_table <- create_outlier_logistic_supp_table(
+  test_results = pai3d_logistic_test_z,
+
+  source_df = ts_df_missense %>%
+    drop_na(PAI3D_pred),
+
+  csv_file = "data/pai3d_age_z_logistic.csv",
+
+  outcome_col = "PAI3D_pred",
+  outcome_vec = c(
+    "Likely benign",
+    "Ambiguous",
+    "Likely pathogenic"
+  ),
+
+  outlier_col = "time_z",
+  outlier_thresh_vec = c(-Inf, -2, -1, 0, 1, 2, 3, 4, Inf),
+
+  group_col = "AC_ts",
+  group_vals = 1:max_ac_count(ts_lf_merge, AF_thresh = 0.001),
+
+  direction = "between",
+
+  outlier_label = "Ultra-rare (DAF < 0.1%) missense mutation frequency-controlled age Z-score",
+  outcome_label = "PrimateAI-3D class"
+)
+```
+
 Plot...
 ```{r}
 pai3d_zcat_plot <- pai3d_logistic_test_z %>%
@@ -623,136 +1088,4 @@ Save to PDF
 ggsave(paste0(paths$plots_dir, "primateai_3d_age_freq_plot.pdf"), pai3d_supp_plot, width = 8, height = 13)
 ```
 
-## Constraint Z-score plot
-gnomADv3.1 released Z-scores showing mutational constraint across chromosomes
-We can take a look at if there is any enrichment/depletion of allele frequency / allele age outliers (Z-scores) within constraint Z-score bins.
-
-```{r}
-## takes a while, checkpoint
-checkpoint_gnocchi_regress <- paste0(paths$output_dir, "checkpoints/all-chr17-gnocchi_z-regression.tsv.gz")
-if (file.exists(checkpoint_gnocchi_regress)) {
-  gnocchi_logistic_test_between_z <- fread(
-    checkpoint_gnocchi_regress
-  )
-} else {
-  gnocchi_logistic_test_between_z <-
-  outlier_logistic_loop_wrapper(
-    df = ts_lf_merge %>%
-      filter(chromosome == "chr17"),
-    outcome_col = "gnocchi_z",
-    outcome_vec = c("<n4", "n3-n4", "n2-n3", "n1-n2", "0-n1", "0-1", "1-2", "2-3", "3-4", ">=4"),
-    outlier_thresh_vec = c(-Inf, 0, 1, 2, 3, 4, Inf),
-    outlier_col = "time_z",
-    group_vals = c(1:max_ac_count(ts_lf_merge, AF_thresh = 0.001)),
-    group_col = "AC_ts",
-    direction = "between",
-    correct_groups = FALSE,
-    group_as_factor = FALSE
-  )
-}
-
-gnocchi_logistic_test_between_z %<>%
-mutate(outlier_score = gsub(" - ", " to ", outlier_score),
-       outlier_score = case_when(
-        outlier_score == "-Inf to 0" ~ "< 0",
-        outlier_score == "4 to Inf" ~ "> 4",
-        TRUE ~ outlier_score
-       )) 
-```
-
-```{r}
-order_constraint <- c("<n4", "n3-n4", "n2-n3", "n1-n2", "0-n1", "0-1", "1-2", "2-3", "3-4", ">=4")
-gnocchi_z_plot <- gnocchi_logistic_test_between_z %>%
-enrichment_depletion_plot(
-  group_col = "gnocchi_z",
-  outlier_scores = unique(gnocchi_logistic_test_between_z$outlier_score),
-  group_vals = order_constraint
-) +
-scale_fill_viridis(option = "A", discrete = TRUE) +
-scale_color_viridis(option = "A", discrete = TRUE) +
-labs(
-  x = "Frequency-controlled age z-score bin",
-  y = "Relative P(class membership)"
-) +
-coord_cartesian(ylim = c(-0.4, 0.4)) +
-ggtitle("GEL DAF < 0.1%") +
-theme(
-    plot.title = element_text(size = rel(0.8)),  # Match axis text size
-    axis.text = element_text(size = rel(0.8))    # Adjust axis text size if needed
-  )
-```
-
-Constraint Z scores
-```{r}
-#### gnocchi constraint
-constraint_gnocchi <- fread(
-    file.path(paste0(paths$output,"all-chr17-gnocchi_constraint.tsv.gz"))
-  ) %>%
-  filter(
-    !(start > 18276569 & end < 26718757)
-  )
-```
-
-```{r}
-gnocchi_plot_constraint <- constraint_gnocchi %>%
-  mutate(
-    ymax = 1, ymin = -1,
-    gnocchi_z = factor(gnocchi_z, levels = order_constraint)
-  ) %>%
-  ggplot() +
-  theme_bw(base_size = 20) +
-  geom_rect(
-    aes(xmin = start/1e6, xmax = end/1e6,
-        ymin = ymin, ymax = ymax,
-        colour = gnocchi_z, fill = gnocchi_z),
-    alpha = 0.75
-  ) +
-  scale_y_continuous(expand = c(0,0)) +
-  scale_x_continuous(expand = c(0,0)) +
-  scale_fill_viridis(option = "A", discrete = TRUE) +
-  scale_color_viridis(option = "A", discrete = TRUE) +
-  labs(
-    x = "Position (Mb)\nChromosome 17",
-    fill   = "gnocchi constraint class (z-score bin)",
-    colour = "gnocchi constraint class (z-score bin)"
-  ) +
-  guides(
-    fill = guide_legend(
-      title.position = "top",
-      title.hjust    = 0.5,
-      nrow           = 1,
-      label = FALSE,
-      keywidth  = unit(25, "pt"),
-      keyheight = unit(25, "pt")
-    ),
-    colour = "none"
-  ) +
-  theme(
-    legend.position     = "top",
-    legend.box          = "horizontal",
-    legend.title.align  = 0.5,
-    legend.spacing.x     = unit(3, "pt"),
-    panel.grid          = element_blank(),
-    axis.text.y         = element_blank(),
-    axis.title.y        = element_blank(),
-    axis.ticks.y        = element_blank()
-  ) +
-  geom_vline(xintercept = c(18276569, 26718757)/1e6, linewidth = 0.5)
-```
-
-```{r, fig.width = 10, fig.height = 6}
-gnocchi_z_score_fig <- ggarrange(
-  ggarrange(NULL, gnocchi_plot_constraint, nrow = 1, widths = c(0.07, 1)),
-  NULL,
-  gnocchi_z_plot,
-  ncol = 1,
-  heights = c(0.65, 0.05, 1)
-)
-gnocchi_z_score_fig
-```
-
-Save to PDF for paper
-```{r}
-ggsave(paste0(paths$plots_dir, "tmp_gel_constraint_gnocchi_figure_toedit.pdf"), gnocchi_z_score_fig, width = 12, height = 9)
-```
 Ill manually annotate with some stuff too.

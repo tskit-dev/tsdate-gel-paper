@@ -449,11 +449,65 @@ pca_counts_by_ac <- ggplot(comp_trunc_ur, aes(x = AC_ts, y = prop, fill = pop, c
 ```
 
 Vast majority of variants of higher AC counts are non-specific
+```{r}
+# Total mutations in the full dataset
+total_mutations <- ts_lf_merge %>%
+  summarise(
+    total_mutations = n()
+  )
+
+# Total mutations per PCA group in the full dataset
+mutations_by_pop <- ts_lf_merge %>%
+  count(
+    pop,
+    name = "n_mutations"
+  ) %>%
+  arrange(desc(n_mutations))
+
+
+# Total number of mutations represented in the figure
+total_mutations_in_figure <- comp_trunc_ur %>%
+  summarise(
+    total_mutations = sum(n)
+  )
+
+mutations_by_pop_in_figure <- comp_trunc_ur%>%
+  group_by(pop) %>%
+  summarise(
+    n_mutations = sum(n)
+  )
+
+knitr::kable(
+  total_mutations,
+  caption = "Total number of mutations"
+)
+
+knitr::kable(
+  mutations_by_pop,
+  caption = "Total number of mutations by PCA group"
+)
+
+knitr::kable(
+  total_mutations_in_figure,
+  caption = "Total number of mutations included in the geometric mean age figure"
+)
+
+knitr::kable(
+  mutations_by_pop_in_figure,
+  caption = "Number of mutations included in the geometric mean age figure by PCA group"
+)
+```
+
+By population and AC
+```{r}
+
+```
 
 Summarise geometric mean age distributions...
 ```{r}
 comp_trunc_ur %<>%
  filter(n > 15) # remove intervals with < 15 mutations
+
 pca_age_by_ac <- ggplot(comp_trunc_ur, aes(x = AC_ts, y = gmean_age, colour = pop, fill = pop, group = pop)) +
   geom_point(shape = 21) +
   geom_smooth() +
@@ -645,10 +699,16 @@ corr_plot <- create_joint_density_plot(
 corr_plot
 ```
 
-Test the pearsons's correlation
+Test the spearman's correlation
 ```{r}
 test = cor.test(anc_agesd_plot_data$geometric_mean_age_singletons, anc_agesd_plot_data$number_of_singletons, method = "spearman", use = "complete.obs")
-test
+test$p.value
+```
+
+Test the pearsons's correlation
+```{r}
+test_pearson = cor.test(anc_agesd_plot_data$geometric_mean_age_singletons, anc_agesd_plot_data$number_of_singletons, use = "complete.obs")
+test$p.value
 ```
 
 Does this correlation hold within PCA groupings as well
@@ -657,13 +717,31 @@ Does this correlation hold within PCA groupings as well
 correlation_results <- anc_agesd_plot_data |>
   group_by(pop) |>
   group_modify(~{
-    test <- cor.test(.x$geometric_mean_age_singletons, .x$number_of_singletons, method = "spearman", use = "complete.obs")
+
+    cor_data <- .x |>
+      filter(
+        complete.cases(
+          geometric_mean_age_singletons,
+          number_of_singletons
+        )
+      )
+
+    test <- cor.test(
+      cor_data$geometric_mean_age_singletons,
+      cor_data$number_of_singletons,
+      method = "spearman"
+    )
+
     tibble(
-      spearman_r = test$estimate,
+      n_samples = nrow(cor_data),
+      n_singletons = sum(cor_data$number_of_singletons),
+      spearman_r = unname(test$estimate),
       p_value = test$p.value
     )
+
   }) |>
   ungroup()
+
 knitr::kable(correlation_results)
 ```
 
@@ -1087,7 +1165,7 @@ plot4_d <- create_joint_density_plot(
   cor_size = 5.5,
   cor_method = "pearson",
   cor_label_x = 125,
-  cor_label_y = 100,
+  cor_label_y = 200,
   pop_colours_vec = pop_colours_vec
 )
 ```
@@ -1135,7 +1213,7 @@ fig4_plot <- ggarrange(
 
 Make PDF
 ```{r}
-ggsave(paste0(paths$plots_dir, "tmp_main_figure_ancestry_to_edit.pdf"), width = 15.25, height = 13)
+ggsave(paste0(paths$plots_dir, "tmp_main_figure_ancestry_to_edit.pdf"), width = 15.25, height = 13, device = cairo_pdf)
 ```
 
 ## Oceania regression 

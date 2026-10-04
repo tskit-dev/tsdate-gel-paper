@@ -1,0 +1,17 @@
+.snakemake/
+*.log
+*.swp
+*.swo
+test*png
+test*pdf
+test*tex
+full*png
+full*pdf
+full*tex
+debug/
+debug.py
+
+# working notes — keep untracked
+IMPLEMENTATION_PLAN.md
+HANDOFF.md
+proto/

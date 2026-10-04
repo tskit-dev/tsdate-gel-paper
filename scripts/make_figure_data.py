@@ -278,9 +278,9 @@ def make_validation_aDNA_data(prefix, chromosome=None):
         "inout": {"pos": [], 'lower': [], 'upper': [], "derived_state": []},
     }
     tgp_dir = data_dir / "tgp"
-    match = "all-chr([0-9]+)(.*)-filterNton23-truncate-0-0-0-mm0-post-processed-simplified-SDN-singletons-dated-metadata.trees.tsz"
+    match = r"1kgp_chr([0-9]+)(.*)\.trees\.tsz$"
     for fn in os.listdir(tgp_dir):
-        m = re.search(str(match), fn)
+        m = re.match(match, fn)
         if not m or int(m.group(1)) != chromosome:
             continue
         base_ts = tszip.load(tgp_dir / fn)
@@ -557,7 +557,7 @@ def _process_inversion_ts(ts,
 
 def make_validation_inversion_data(prefix,
                                    select=None,
-                                   ts_path="tgp/with_singletons/all-chr17q45M~83M-filterNton23-truncate-0-0-0-mm0-post-processed-simplified-SDN-singletons-dated-metadata.trees",
+                                   ts_path="tgp/1kgp_chr17q_45M-83M.trees.tsz",
                                    snp_csv="chr17inversion/donnelly_et_al_table_2.csv",
                                    relate_csv="chr17inversion/chr17q21.31_time_plot.csv",
                                    chromosome=17,
@@ -569,7 +569,7 @@ def make_validation_inversion_data(prefix,
     (time_windows, genomic_windows and coal_mat) and a dataframe of Relate age 
     estimates for the inversion.
     """
-    ts = tskit.load(f"{data_dir}/{ts_path}")
+    ts = tszip.load(f"{data_dir}/{ts_path}")
     snp_df_in = pd.read_csv(f"{data_dir}/{snp_csv}")
     relate_df_in = pd.read_csv(f"{data_dir}/{relate_csv}")
 

@@ -15,14 +15,14 @@ MODELS = config["demogr-models"]
 MODEL_NAMES = sorted(MODELS.keys())
 CONTIG = config["contig"]
 SEEDS = {m: RNG.integers(2 ** 32 - 1, size=1).item() for m in MODELS}
-MAX_FREQ = config["max-freq"] 
-COVERAGE_METRICS_PATH = f"{TREES_DIR}/{{model}}.coverage.pkl"
+MAX_FREQ = config["max-freq"]
 INTERVAL_WIDTH = config["interval-width"]
 
 
 rule all:
     input:
         plot = f"{OUTPUT_PREFIX}.pdf",
+        table = f"{OUTPUT_PREFIX}.counts.tex",
 
 
 rule simulate:
@@ -71,8 +71,8 @@ rule date:
     output: 
         simulate_trees = os.path.join(TREES_DIR, "{model}.simulate.date.tsz"),
         infer_trees = os.path.join(TREES_DIR, "{model}.infer.date.tsz"),
-        simulate_mutation_posteriors = os.path.join(TREES_DIR, "{model}.simulate.date.mutation.npy"),
-        infer_mutation_posteriors = os.path.join(TREES_DIR, "{model}.infer.date.mutation.npy"),
+        simulate_node_posteriors = os.path.join(TREES_DIR, "{model}.simulate.date.node.npy"),
+        infer_node_posteriors = os.path.join(TREES_DIR, "{model}.infer.date.node.npy"),
     log: os.path.join(TREES_DIR, "{model}.date.log")
     run:
         import tsdate
@@ -109,8 +109,8 @@ rule date:
         )
         tszip.compress(simulate, output.simulate_trees)
         tszip.compress(infer, output.infer_trees)
-        np.save(output.simulate_mutation_posteriors, simulate_fit.mutation_posteriors())
-        np.save(output.infer_mutation_posteriors, infer_fit.mutation_posteriors())
+        np.save(output.simulate_node_posteriors, simulate_fit.node_posteriors())
+        np.save(output.infer_node_posteriors, infer_fit.node_posteriors())
 
 
 rule mutations:
@@ -118,8 +118,8 @@ rule mutations:
         true_trees = rules.simulate.output.trees,
         simulate_trees = rules.date.output.simulate_trees,
         infer_trees = rules.date.output.infer_trees,
-        simulate_mutation_posteriors = rules.date.output.simulate_mutation_posteriors,
-        infer_mutation_posteriors = rules.date.output.infer_mutation_posteriors,
+        simulate_node_posteriors = rules.date.output.simulate_node_posteriors,
+        infer_node_posteriors = rules.date.output.infer_node_posteriors,
     output:
         simulate_mutation_intervals = os.path.join(TREES_DIR, "{model}.simulate.intervals.mutation.npy"),
         infer_mutation_intervals = os.path.join(TREES_DIR, "{model}.infer.intervals.mutation.npy"),
@@ -130,14 +130,13 @@ rule mutations:
     run:
         import tskit
         import tszip
-        import scipy.stats
 
         interval_width = np.array(params.interval_width)
         true_trees = tszip.load(input.true_trees)
         simulate_trees = tszip.load(input.simulate_trees)
-        simulate_mutation_posteriors = np.load(input.simulate_mutation_posteriors)
+        simulate_node_posteriors = np.load(input.simulate_node_posteriors)
         infer_trees = tszip.load(input.infer_trees)
-        infer_mutation_posteriors = np.load(input.infer_mutation_posteriors)
+        infer_node_posteriors = np.load(input.infer_node_posteriors)
         muts_per_site = np.bincount(infer_trees.mutations_site, minlength=infer_trees.num_sites)
         biallelic = np.flatnonzero(muts_per_site == 1)
         position_map = {infer_trees.sites_position[s]: i for i, s in enumerate(biallelic)}
@@ -164,31 +163,56 @@ rule mutations:
                         ages[i] = ts.mutations_time[m.id]
             return ages
 
-        def mutation_ci(ts, posteriors, intervals):
-            assert posteriors.size == ts.num_mutations
+        def mutation_ci(ts, node_posteriors, intervals, n_samples=2000, seed=0, chunk=10000):
+            # Central credible intervals for mutation age by Monte Carlo from the *exact*
+            # within-branch posterior: a mutation's age is Uniform(t_child, t_parent), with
+            # the bounding node ages drawn from their gamma posteriors (a node with zero
+            # posterior variance -- e.g. a sample at time 0 -- is treated as a fixed point),
+            # conditioned on t_parent > t_child.
             lower_quantile = (1 - intervals) / 2
             upper_quantile = 1 - lower_quantile
             lower = np.full((len(position_map), intervals.size), np.nan)
             upper = np.full((len(position_map), intervals.size), np.nan)
+            child_mean = np.full(len(position_map), np.nan)
+            child_var = np.full(len(position_map), np.nan)
+            parent_mean = np.full(len(position_map), np.nan)
+            parent_var = np.full(len(position_map), np.nan)
             biallelic = np.bincount(ts.mutations_site, minlength=ts.num_sites) == 1
             for t in ts.trees():
                 for m in t.mutations():
                     pos = ts.sites_position[m.site]
                     if m.edge != tskit.NULL and biallelic[m.site] and pos in position_map:
+                        parent = t.parent(m.node)
+                        if parent == tskit.NULL:
+                            continue
                         i = position_map[pos]
-                        shape = posteriors["mean"][m.id] ** 2 / posteriors["variance"][m.id]
-                        rate = posteriors["mean"][m.id] / posteriors["variance"][m.id]
-                        distr = scipy.stats.gamma(shape, scale=1/rate)
-                        if shape > 1:
-                            lower[i] = 0.0
-                            upper[i] = distr.ppf(intervals)
-                        else:
-                            lower[i] = distr.ppf(lower_quantile)
-                            upper[i] = distr.ppf(upper_quantile)
+                        child_mean[i], child_var[i] = node_posteriors["mean"][m.node], node_posteriors["variance"][m.node]
+                        parent_mean[i], parent_var[i] = node_posteriors["mean"][parent], node_posteriors["variance"][parent]
+            ok = np.flatnonzero(np.isfinite(child_mean) & np.isfinite(parent_mean) & (parent_var > 0))
+            rng = np.random.default_rng(seed)
+            for s in range(0, ok.size, chunk):
+                idx = ok[s:s + chunk]
+                n = idx.size
+                # child age: gamma where the posterior has spread, else fixed (e.g. samples at 0)
+                cm, cv = child_mean[idx], child_var[idx]
+                t_child = np.repeat(cm[:, None].astype(float), n_samples, axis=1)
+                free = cv > 0
+                if free.any():
+                    sc, rc = cm[free] ** 2 / cv[free], cm[free] / cv[free]
+                    t_child[free] = rng.gamma(sc[:, None], 1 / rc[:, None], size=(int(free.sum()), n_samples))
+                # parent age: gamma (parent_var > 0 by construction)
+                pm, pv = parent_mean[idx], parent_var[idx]
+                sp, rp = pm ** 2 / pv, pm / pv
+                t_parent = rng.gamma(sp[:, None], 1 / rp[:, None], size=(n, n_samples))
+                # mutation age uniform on the (valid) branch; drop draws with parent <= child
+                valid = t_parent > t_child
+                t_m = np.where(valid, t_child + rng.random((n, n_samples)) * (t_parent - t_child), np.nan)
+                lower[idx] = np.nanquantile(t_m, lower_quantile, axis=1).T
+                upper[idx] = np.nanquantile(t_m, upper_quantile, axis=1).T
             return lower, upper
 
-        np.save(output.simulate_mutation_intervals, mutation_ci(simulate_trees, simulate_mutation_posteriors, interval_width))
-        np.save(output.infer_mutation_intervals, mutation_ci(infer_trees, infer_mutation_posteriors, interval_width))
+        np.save(output.simulate_mutation_intervals, mutation_ci(simulate_trees, simulate_node_posteriors, interval_width))
+        np.save(output.infer_mutation_intervals, mutation_ci(infer_trees, infer_node_posteriors, interval_width))
         np.save(output.mutation_frequency, mutation_frequency(true_trees)) 
         np.save(output.mutation_age, mutation_age(true_trees))
 
@@ -202,13 +226,16 @@ rule calculate:
     output:
         simulate_mutation_coverage = os.path.join(TREES_DIR, "{model}.simulate.coverage.mutation.npy"),
         infer_mutation_coverage = os.path.join(TREES_DIR, "{model}.infer.coverage.mutation.npy"),
+        simulate_mutation_coverage_lowfreq = os.path.join(TREES_DIR, "{model}.simulate.coverage.lowfreq.mutation.npy"),
+        infer_mutation_coverage_lowfreq = os.path.join(TREES_DIR, "{model}.infer.coverage.lowfreq.mutation.npy"),
     log:
         logfile = os.path.join(TREES_DIR, "{model}.calculate.log"),
     params:
         interval_width = INTERVAL_WIDTH,
+        max_freq = MAX_FREQ,
+        num_samples = lambda wildcards: 2 * sum(MODELS[wildcards.model]["samples"].values()),
     run:
         import tskit
-        import pickle
 
         mutation_frequency, mutation_age = np.load(input.mutation_frequency), np.load(input.mutation_age)
         mutation_valid = mutation_frequency != tskit.NULL
@@ -218,65 +245,145 @@ rule calculate:
         simulate_mutation_lower, simulate_mutation_upper = simulate_mutation_lower.T, simulate_mutation_upper.T
         infer_mutation_lower, infer_mutation_upper = infer_mutation_lower.T, infer_mutation_upper.T
 
-        interval_width = np.array(params.interval_width)
-        simulate_mutation_coverage = np.full(interval_width.size, np.nan)
-        infer_mutation_coverage = np.full(interval_width.size, np.nan)
-        for j, width in enumerate(interval_width):
-            infer_mutation_coverage[j] = np.logical_and(
-                mutation_age > infer_mutation_lower[j], 
-                mutation_age < infer_mutation_upper[j],
-            ).sum() / mutation_age.size
-            simulate_mutation_coverage[j] = np.logical_and(
-                mutation_age > simulate_mutation_lower[j], 
-                mutation_age < simulate_mutation_upper[j],
-            ).sum() / mutation_age.size
+        # mutation_frequency is an allele count; the cutoff is a frequency, so translate
+        # it to copies. Floor at a single copy (singletons) so small sample sizes don't
+        # filter out every mutation (e.g. the test config falls back to singletons only).
+        count_cutoff = max(1, params.max_freq * params.num_samples)
+        lowfreq = mutation_frequency <= count_cutoff
 
-        np.save(output.simulate_mutation_coverage, simulate_mutation_coverage)
-        np.save(output.infer_mutation_coverage, infer_mutation_coverage)
+        interval_width = np.array(params.interval_width)
+
+        def coverage(age, lower, upper):
+            cov = np.full(interval_width.size, np.nan)
+            for j in range(interval_width.size):
+                cov[j] = np.logical_and(age > lower[j], age < upper[j]).sum() / age.size
+            return cov
+
+        np.save(output.simulate_mutation_coverage, coverage(mutation_age, simulate_mutation_lower, simulate_mutation_upper))
+        np.save(output.infer_mutation_coverage, coverage(mutation_age, infer_mutation_lower, infer_mutation_upper))
+        np.save(output.simulate_mutation_coverage_lowfreq, coverage(mutation_age[lowfreq], simulate_mutation_lower[:, lowfreq], simulate_mutation_upper[:, lowfreq]))
+        np.save(output.infer_mutation_coverage_lowfreq, coverage(mutation_age[lowfreq], infer_mutation_lower[:, lowfreq], infer_mutation_upper[:, lowfreq]))
 
 
 rule plot:
     input:
+        mutation_age = expand(rules.mutations.output.mutation_age, model=MODEL_NAMES),
+        mutation_frequency = expand(rules.mutations.output.mutation_frequency, model=MODEL_NAMES),
+        infer_mutation_intervals = expand(rules.mutations.output.infer_mutation_intervals, model=MODEL_NAMES),
         infer_mutation_coverage = expand(rules.calculate.output.infer_mutation_coverage, model=MODEL_NAMES),
         simulate_mutation_coverage = expand(rules.calculate.output.simulate_mutation_coverage, model=MODEL_NAMES),
+        infer_mutation_coverage_lowfreq = expand(rules.calculate.output.infer_mutation_coverage_lowfreq, model=MODEL_NAMES),
+        simulate_mutation_coverage_lowfreq = expand(rules.calculate.output.simulate_mutation_coverage_lowfreq, model=MODEL_NAMES),
     output:
         plot = rules.all.input.plot,
     params:
         interval_width = INTERVAL_WIDTH,
+        max_freq = MAX_FREQ,
     run:
         import matplotlib.pyplot as plt
-        import pandas
-        import pickle
 
         interval_width = np.array(params.interval_width)
-        rows, cols = 1, len(MODEL_NAMES)
-        fig, axs = plt.subplots(
-            rows, cols, 
-            figsize=(2 * cols + 2, 2 * rows + 1),
-            sharey="row", sharex=True,
-            constrained_layout=True,
-            squeeze=False,
-        )
-        for i, (mut_infr, mut_true, name) in enumerate(
-            zip(
-                input.infer_mutation_coverage, 
-                input.simulate_mutation_coverage, 
-                MODEL_NAMES,
-            )
-        ):
-            axs[0, i].plot(interval_width, np.load(mut_true), "-o", markersize=2, color="firebrick", label="true+tsdate")
-            axs[0, i].plot(interval_width, np.load(mut_infr), "-o", markersize=2, color="dodgerblue", label="tsinfer+tsdate")
-            axs[0, i].axline((0.5, 0.5), (0.6, 0.6), color="black", linestyle="dashed")
-            axs[0, i].set_title(name, family="monospace", size=8)
-            axs[0, i].set_xlim(0, 1)
-            axs[0, i].set_ylim(0, 1)
 
-        fig.supylabel("Posterior interval coverage", size=10)
-        fig.supxlabel("Expected interval coverage for mutation age", size=10)
-        fig.legend(
-            *axs[0, 0].get_legend_handles_labels(),
-            loc="outside upper center",
-            frameon=False,
-            ncol=2,
+        def accuracy(age_path, freq_path, intervals_path):
+            """True mutation age vs the inferred-ARG point estimate (posterior median, taken
+            as the midpoint of the tightest central credible interval). Restricted to mapped,
+            finite, positive ages so the log-log hexbin is well defined."""
+            age = np.load(age_path)
+            freq = np.load(freq_path)
+            intervals = np.load(intervals_path)
+            est = (intervals[0, :, 0] + intervals[1, :, 0]) / 2
+            ok = (freq != -1) & np.isfinite(est) & (age > 0) & (est > 0)
+            return age[ok], est[ok]
+
+        # composite figure: accuracy (top row), all-variant coverage (middle row), and
+        # ultra-low-frequency coverage (bottom row), with the demographic models as columns.
+        fig, axs = plt.subplots(
+            3, len(MODEL_NAMES),
+            figsize=(len(MODEL_NAMES) * 2.5, 8.0),
+            sharex="row", sharey="row",
+            constrained_layout=True,
         )
-        plt.savefig(output.plot)
+        for i, model in enumerate(MODEL_NAMES):
+            # accuracy: inferred-ARG estimate vs true age (all variants), inferred trees
+            truth, est = accuracy(input.mutation_age[i], input.mutation_frequency[i], input.infer_mutation_intervals[i])
+            r = np.corrcoef(np.log10(truth), np.log10(est))[0, 1]
+            xm = np.nanmean(truth)
+            axs[0, i].hexbin(truth, est, mincnt=1, xscale="log", yscale="log")
+            axs[0, i].axline((xm, xm), (xm + 1, xm + 1), linestyle="dashed", color="red")
+            axs[0, i].text(0.01, 0.99, f"$r={r:.3f}$", size=9, transform=axs[0, i].transAxes, ha="left", va="top")
+            axs[0, i].set_title(model, family="monospace", size=8)
+            if i == 0:
+                axs[0, i].set_title("A.", loc="left", fontweight="bold")
+            # coverage over all variants
+            axs[1, i].axline((0.5, 0.5), (0.6, 0.6), color="black", linestyle="dashed", label="true")
+            axs[1, i].plot(interval_width, np.load(input.simulate_mutation_coverage[i]), "-o", markersize=2, color="firebrick", label="true+tsdate")
+            axs[1, i].plot(interval_width, np.load(input.infer_mutation_coverage[i]), "-o", markersize=2, color="dodgerblue", label="tsinfer+tsdate")
+            axs[1, i].set_title(model, family="monospace", size=8)
+            if i == 0:
+                axs[1, i].set_title("B.", loc="left", fontweight="bold")
+            axs[1, i].set_xlim(0, 1)
+            axs[1, i].set_ylim(0, 1)
+            axs[1, i].set_xticks([0.3, 0.6, 0.9])
+            # coverage over ultra-low-frequency variants
+            axs[2, i].axline((0.5, 0.5), (0.6, 0.6), color="black", linestyle="dashed", label="true")
+            axs[2, i].plot(interval_width, np.load(input.simulate_mutation_coverage_lowfreq[i]), "-o", markersize=2, color="firebrick", label="true+tsdate")
+            axs[2, i].plot(interval_width, np.load(input.infer_mutation_coverage_lowfreq[i]), "-o", markersize=2, color="dodgerblue", label="tsinfer+tsdate")
+            axs[2, i].set_title(model, family="monospace", size=8)
+            if i == 0:
+                axs[2, i].set_title("C.", loc="left", fontweight="bold")
+            axs[2, i].set_xlim(0, 1)
+            axs[2, i].set_ylim(0, 1)
+            axs[2, i].set_xticks([0.3, 0.6, 0.9])
+
+        axs[0, 0].set_ylabel("Inferred mutation age", size=10)
+        axs[1, 0].set_ylabel("Posterior interval coverage", size=10)
+        axs[2, 0].set_ylabel("Posterior interval coverage", size=10)
+        axs[1, 0].legend(loc="upper left", bbox_to_anchor=(0.0, 1.0), fontsize=8, frameon=False)
+        axs[2, 0].legend(loc="upper left", bbox_to_anchor=(0.0, 1.0), fontsize=8, frameon=False)
+
+        # one centered x-axis label per row, via an invisible axes spanning the row's columns
+        gs = axs[0, 0].get_gridspec()
+        for r, xlabel in [(0, "True mutation age (all variants)"),
+                          (1, "Expected interval coverage (all variants)"),
+                          (2, f"Expected interval coverage (frequency <0.1% of samples)")]:
+            span = fig.add_subplot(gs[r, :])
+            span.set_xticks([])
+            span.set_yticks([])
+            span.set_frame_on(False)
+            span.set_xlabel(xlabel, size=10, labelpad=20)
+        fig.savefig(output.plot)
+
+
+rule tabulate:
+    input:
+        mutation_frequency = expand(rules.mutations.output.mutation_frequency, model=MODEL_NAMES),
+    output:
+        table = rules.all.input.table,
+    params:
+        max_freq = MAX_FREQ,
+    run:
+        import tskit
+
+        handle = open(output.table, "w")
+        handle.write(r"\begin{tabular}{lrrr}" + "\n")
+        handle.write(
+            r"\texttt{stdpopsim} model & Sample haplotypes & All variants & "
+            fr"Frequency $<{params.max_freq * 100:g}\%$ \\ " + "\n"
+        )
+        handle.write(r"\hline" + "\n")
+        for fr_path, nm in zip(input.mutation_frequency, MODEL_NAMES):
+            # mutations mapped to both the true and inferred trees (frequency != NULL),
+            # split into all variants and those below the frequency cutoff (a count, with a
+            # floor of a single copy so small sample sizes fall back to singletons).
+            n_hap = 2 * sum(MODELS[nm]["samples"].values())
+            freq = np.load(fr_path)
+            valid = freq[freq != tskit.NULL]
+            count_cutoff = max(1, params.max_freq * n_hap)
+            n_low = int((valid <= count_cutoff).sum())
+            handle.write(
+                r"\texttt{" + nm.replace("_", r"\_") + r"} & "
+                fr"{n_hap:,} & {valid.size:,} & {n_low:,} \\ " + "\n"
+            )
+        handle.write(r"\hline" + "\n")
+        handle.write(r"\end{tabular}")
+        handle.close()

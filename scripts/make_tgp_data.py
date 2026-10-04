@@ -9,6 +9,7 @@ import shutil
 from datetime import datetime
 import sgkit as sg
 import re
+import tempfile
 import tszip
 
 
@@ -477,37 +478,39 @@ def make_tgp_subset_data(
 
 
 def make_tgp_table_data(*_ignored_pos,
-                        ts_folder_path="data/tgp/with_singletons",
+                        ts_folder_path="data/tgp",
                         csv_path="data/tgp/inference_stats.csv",
                         **_ignored_kw):
     """
-    Pull summary statistics from all the trees inferred from 1000 Genomes data.
+    Pull summary statistics from all the trees inferred from 1000 Genomes data
+    (the 1kgp_*.trees.tsz files from Zenodo; see data/tgp/README.md).
     """
-    pattern = re.compile(r"all-([^-]+)-")
+    pattern = re.compile(r"^1kgp_chr.*\.trees\.tsz$")
     records = []
     for fname in os.listdir(ts_folder_path):
-        if fname.endswith(".trees"):
-            ts = tskit.load(os.path.join(ts_folder_path, fname))
-            match = pattern.search(fname)
-            if match:
-                chunk_name = match.group(1)
-                zip_bytes = os.path.getsize(os.path.join(ts_folder_path, fname))
-                first_pos = min(ts.sites_position)
-                last_pos = max(ts.sites_position)
-                records.append(
-                    {
-                        "region_name": chunk_name,
-                        "first_site_position": first_pos,
-                        "last_site_position": last_pos,
-                        "sequence_length": last_pos - first_pos,
-                        "number_of_sites": ts.num_sites,
-                        "number_of_trees": ts.num_trees,
-                        "number_of_nodes": ts.num_nodes,
-                        "number_of_edges": ts.num_edges,
-                        "number_of_mutations": ts.num_mutations,
-                        "tszip_total_size_bytes": zip_bytes,
-                    }
-                )
+        if pattern.match(fname):
+            ts = tszip.load(os.path.join(ts_folder_path, fname))
+            chunk_name = ts.metadata["region"]
+            # size of the uncompressed .trees file
+            with tempfile.NamedTemporaryFile(suffix=".trees") as tmp:
+                ts.dump(tmp.name)
+                zip_bytes = os.path.getsize(tmp.name)
+            first_pos = min(ts.sites_position)
+            last_pos = max(ts.sites_position)
+            records.append(
+                {
+                    "region_name": chunk_name,
+                    "first_site_position": first_pos,
+                    "last_site_position": last_pos,
+                    "sequence_length": last_pos - first_pos,
+                    "number_of_sites": ts.num_sites,
+                    "number_of_trees": ts.num_trees,
+                    "number_of_nodes": ts.num_nodes,
+                    "number_of_edges": ts.num_edges,
+                    "number_of_mutations": ts.num_mutations,
+                    "tszip_total_size_bytes": zip_bytes,
+                }
+            )
     df = pd.DataFrame.from_records(records)
     numeric_cols = [
         "sequence_length",
