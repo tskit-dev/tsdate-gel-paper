@@ -13,113 +13,92 @@ RESCALING_INTERVALS = config["rescaling-intervals"]
 MIN_BRANCH_LENGTH = config["min-branch-length"]
 CONTIG = config["contig"]
 
-BASE_MODEL = config["base-model"]                 # AmericanAdmixture_4B18 (catalog)
+BASE_MODEL = config["base-model"]
 DFE_ID = config["dfe"]
 MUTATION_RATE = config["mutation-rate"]
-EXON_ONLY = config.get("exon-only", False)        # restrict DFE to exon annotation
+EXON_ONLY = config.get("exon-only", False)        # restrict the DFE to exons
 EXON_ANNOTATION = config.get("exon-annotation", "ensembl_havana_104_exons")
 SLIM_SCALING = config["slim-scaling"]
 SLIM_BURN_IN = config["slim-burn-in"]
 SLIM_PATH = config["slim-path"]
 
-# --- populations / cohort design -------------------------------------------
-REFERENCE_POP = config["reference-pop"]           # EUR: frequency baseline + control
-ANCESTRY_PANELS = config["ancestry-panels"]       # [AFR, EUR, ASIA] -> q columns (order matters)
-N_REFERENCE = config["n-reference"]               # EUR reference-cohort diploids (DAC baseline)
-N_CONTROL = config["n-control"]                   # pure-EUR control targets (non-EUR = 0)
-N_ADMIX_POOL = config["n-admix-pool"]             # oversampled ADMIX pool to subsample from
-N_PANEL = config["n-panel"]                       # AFR/ASIA calibration panel diploids (each)
-N_EUR_CALIB = config["n-eur-calib"]               # EUR diploids used for ancestry-freq calibration
+# --- cohort design ---
+REFERENCE_POP = config["reference-pop"]           # frequency baseline and control population
+ANCESTRY_PANELS = config["ancestry-panels"]       # reference panels for ancestry estimation
+N_REFERENCE = config["n-reference"]               # reference cohort diploids
+N_CONTROL = config["n-control"]                   # unadmixed control diploids
+N_ADMIX_POOL = config["n-admix-pool"]             # admixed diploids to choose groups from
+N_PANEL = config["n-panel"]                       # diploids per non-reference panel
+N_EUR_CALIB = config["n-eur-calib"]               # reference diploids for ancestry estimation
 
-GRID_ADMIX = config["grid-admix"]                 # non-EUR ancestry grid points sourced from ADMIX
-N_PER_GROUP = config["n-per-group"]               # target diploids per group
-N_CANDIDATES = config["n-candidates"]             # closest-N ADMIX per grid point considered before thinning
-GRID_WINDOW = config["grid-window"]               # max |non-EUR - target| to qualify as a candidate
-SOURCE_PURE_COUNTS = config["source-pure-counts"] # {AFR: n, ASIA: n} for the non-EUR = 1.0 group
-N_SITES_ANCESTRY = config["n-sites-ancestry"]     # sites subsampled for the supervised ancestry fit
-IBD_MAX_TIME = config["ibd-max-time"]             # MRCA cutoff (gen) for recent-IBD relatedness
+GRID_ADMIX = config["grid-admix"]                 # target non-EUR ancestry proportions
+N_PER_GROUP = config["n-per-group"]               # diploids per group
+N_CANDIDATES = config["n-candidates"]             # candidates considered per group
+GRID_WINDOW = config["grid-window"]               # max distance from target ancestry
+SOURCE_PURE_COUNTS = config["source-pure-counts"] # unadmixed non-EUR diploids per population
+N_SITES_ANCESTRY = config["n-sites-ancestry"]     # sites for ancestry estimation
+IBD_MAX_TIME = config["ibd-max-time"]             # max MRCA time (generations) for recent IBD
 IBD_MIN_SPAN = config["ibd-min-span"]             # min IBD segment span (bp)
 
 REPLICATES = config["replicates"]
 REPS = [f"rep{i}" for i in range(REPLICATES)]
 SEEDS = {r: RNG.integers(2 ** 32 - 1).item() for r in REPS}
 
-MAX_FREQ = config["max-freq"]                     # frequency-filter threshold (summary plot)
-AGE_FILTER = config["age-filter"]                 # age-filter threshold, generations
-DEL_THRESHOLD = config["del-threshold"]           # |s| above this counts as deleterious
+MAX_FREQ = config["max-freq"]
+AGE_FILTER = config["age-filter"]
+DEL_THRESHOLD = config["del-threshold"]
 
-# group labels: control (non-EUR=0), ADMIX grid points, source-pure (non-EUR=1.0)
+# group labels, by non-EUR ancestry
 def grid_label(v):
     return "control" if v == 0.0 else f"g{int(round(v * 100)):03d}"
 
 GRID_VALUES = [0.0] + list(GRID_ADMIX) + [1.0]
 GROUPS = [grid_label(v) for v in GRID_VALUES]
 
-# --- AUC composite figure ---------------------------------------------------
-# Posterior-coverage / discrimination summary: within each cohort allele-count
-# (AC) stratum and admixture group, how well does mutation age separate
-# deleterious (|s| > s_min) from background (|s| <= s_min) variants. AUC(s_min)
-# = P(deleterious younger than background) = normalised Mann-Whitney U, with the
-# age integrated over its branch (Uniform between child/parent node times).
-AUC_S_GRID = np.logspace(-3.5, -1.0, 16)                 # deleteriousness thresholds swept (C/D x-axis)
-AUC_DAC_COLS = [("1", 1, 1), ("2", 2, 2), ("3", 3, 3)]   # frequency strata shown as columns
-AUC_AGE_DRAWS = 200                                      # branch-integration draws per mutation (proto stays at 10)
-AUC_MIN_MUT = 10                                         # min mutations per class to report a point
-AUC_HIST_GROUP = "g020"                                  # admixture group for the illustration histogram (B)
-AUC_HIST_DAC = 1                                         # allele count for panel B
-AUC_HIST_CUT = 0.05                                      # deleterious partition threshold for panel B
-AUC_ANC_SITES = 30000                                    # sites for the supervised ancestry simplex (A)
-AUC_ANC_EUR_PANEL = 2000                                 # EUR panel haplotypes for the simplex unmixing
+# --- AUROC by admixture group ---
+# AUROC = P(deleterious mutation is younger than background), with ages drawn
+# uniformly along each mutation's branch.
+AUC_S_GRID = np.logspace(-3.5, -1.0, 16)                 # |s| thresholds
+AUC_DAC_COLS = [("1", 1, 1), ("2", 2, 2), ("3", 3, 3)]   # allele-count strata
+AUC_AGE_DRAWS = 200                                      # age draws per mutation
+AUC_MIN_MUT = 10                                         # min mutations per class
+AUC_HIST_GROUP = "g020"                                  # histogram panel: group
+AUC_HIST_DAC = 1                                         # histogram panel: allele count
+AUC_HIST_CUT = 0.05                                      # histogram panel: |s| threshold
+AUC_ANC_SITES = 30000                                    # sites for the ancestry simplex
+AUC_ANC_EUR_PANEL = 2000                                 # EUR haplotypes for the ancestry simplex
 
-# --- EUR coverage / bias composite figure -----------------------------------
-# Singleton (AC=1) age accuracy in the EUR reference cohort, isolating dating from
-# inference: tsdate is run on BOTH the true topology (sim) and the tsinfer topology
-# (inf). Group A = mean log10 age bias vs |s|; B = posterior interval coverage;
-# C = inferred-vs-true age hexbins across |s| bins. Credible intervals are computed
-# by Monte Carlo over the gamma node posteriors (uncertainty-benchmark method).
-COV_WIDTHS = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99])  # nominal CI widths (B)
-COV_NMC = 2000                                           # Monte-Carlo draws per mutation for the CIs
-COV_SGRID = np.logspace(-6, 0, 25)                       # |s| bin edges for the bias curve (A)
-COV_MINN = 500                                           # min mutations per |s| bin to plot a point
-COV_EDGES_C = [0, 1e-4, 1e-3, 1e-2, 1e-1, np.inf]        # |s| bins for the hexbin row (C)
+# --- EUR singleton bias and coverage, dating the true and inferred topologies ---
+COV_WIDTHS = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99])  # nominal interval widths
+COV_NMC = 2000                                           # Monte Carlo draws per mutation
+COV_SGRID = np.logspace(-6, 0, 25)                       # |s| bin edges for the bias curves
+COV_MINN = 500                                           # min mutations per |s| bin
+COV_EDGES_C = [0, 1e-4, 1e-3, 1e-2, 1e-1, np.inf]        # |s| bins for the hexbin panels
 
-# --- EUR CDF-difference figure ----------------------------------------------
-# At single EUR-DAC values (condition on one exact frequency to remove the age-
-# frequency confound), branch-integrated CDF of mutation age for deleterious
-# (|s|>s_cut) minus background (|s|<=s_cut), vs age t. Rows = True / Inferred ARG;
-# columns = the single DACs. The per-mutation clip term is the analytic
-# Uniform(t_child, t_parent) CDF -- the same branch-integration model as the AUROC
-# fig, computed exactly rather than by Monte Carlo.
-CDFDIFF_DACS = [1, 4, 10, 25]                            # single EUR-DAC columns
-CDFDIFF_SCUTS = [1e-3, 3e-3, 1e-2, 3e-2, 1e-1]           # deleterious cutoffs (one curve each)
+# --- EUR CDF differences (deleterious minus background) at single allele counts ---
+CDFDIFF_DACS = [1, 4, 10, 25]                            # allele counts (columns)
+CDFDIFF_SCUTS = [1e-3, 3e-3, 1e-2, 3e-2, 1e-1]           # |s| thresholds (one curve each)
 CDFDIFF_TGRID = np.logspace(0, 5, 160)                   # age grid (generations)
-CDFDIFF_MINMUT = 10                                      # min mutations per class to draw a curve
-CDFDIFF_NCAP = 50000                                     # max mutations per CDF (subsample for speed)
+CDFDIFF_MINMUT = 10                                      # min mutations per class
+CDFDIFF_NCAP = 50000                                     # max mutations per CDF
 
-# --- EUR AUROC-vs-DAC figure ------------------------------------------------
-# P(deleterious younger than background) = AUROC at single EUR-DAC values, vs DAC,
-# for several deleterious/background splits (|s|>0 vs neutral, then |s|>1e-3 .. 1e-1);
-# True ARG vs inferred ARG side by side, points + linear fits. Reuses eur_cdfdiff_data.
-AUROC_DACS = np.arange(1, 31)                            # single EUR-DAC values (x-axis)
-AUROC_SPLITS = [0.0, 1e-3, 1e-2, 10 ** -1.5, 1e-1]       # |s| split thresholds (0 => |s|>0 vs neutral s=0)
-AUROC_R = 200                                            # branch-integration draws per mutation
-AUROC_MINMUT = 10                                        # min mutations per class to plot a point
-AUROC_NCAP = 50000                                       # cell cap for the AUROC draws
-# illustrative top-row panels on the TRUE ARG (A: joint age-|s| cloud at one DAC; B: AUROC(s_min) curve)
-AUROC_DACSEL = 2                                         # the highlighted single DAC for panels A/B
-AUROC_SMIN_LINE = 0.1                                    # discrimination line drawn in A / marked in B
-AUROC_FLOOR_S = 1e-5                                     # |s| floor so neutral shows as a bottom band (log axis)
-AUROC_SGRID = np.logspace(-4, -0.7, 30)                  # s_min sweep for the B curve
-AUROC_OTHER_DACS = [1, 3, 4, 5]                          # gray context curves in B (AC 1-5 except DACSEL)
-AUROC_XMAX = 10 ** -0.15                                 # B x-axis extends past the last curve point -> room for AC labels
+# --- EUR AUROC vs allele count ---
+AUROC_DACS = np.arange(1, 31)                            # allele counts (x-axis)
+AUROC_SPLITS = [0.0, 1e-3, 1e-2, 10 ** -1.5, 1e-1]       # |s| thresholds (0: |s| > 0 vs neutral)
+AUROC_R = 200                                            # age draws per mutation
+AUROC_MINMUT = 10                                        # min mutations per class
+AUROC_NCAP = 50000                                       # max mutations per allele count
+# panels A and B use the true ARG
+AUROC_DACSEL = 2                                         # allele count for panels A and B
+AUROC_SMIN_LINE = 0.1                                    # |s| threshold shown in panels A and B
+AUROC_FLOOR_S = 1e-5                                     # |s| floor, so neutral sites show on a log axis
+AUROC_SGRID = np.logspace(-4, -0.7, 30)                  # s_min values for panel B
+AUROC_OTHER_DACS = [1, 3, 4, 5]                          # other allele counts shown in panel B
+AUROC_XMAX = 10 ** -0.15                                 # panel B x-axis limit
 
 
-# ---------------------------------------------------------------------------
-# Cohort selection helpers (run in the `select` rule on the true ARG, before
-# tsinfer). Ancestry from a supervised genotype proxy; each ADMIX grid point is
-# filled with the least-related individuals near the target ancestry, via
-# recent-IBD relative ranking (structure-free; reads the true ARG).
-# ---------------------------------------------------------------------------
+# --- cohort selection ---
+# Admixed individuals are grouped by estimated ancestry, keeping the least related.
 def _individuals(ts, nodes):
     """Map sample nodes -> {individual_id: (node0, node1)} (diploid)."""
     by_ind = {}
@@ -130,14 +109,11 @@ def _individuals(ts, nodes):
 
 
 def estimate_ancestry(ts, admix_nodes, calib_nodes, rng):
-    """Supervised global ancestry per ADMIX individual: solve the simplex-
-    constrained least squares q over panel derived-allele freqs (genotype-based,
-    so simplification-/inference-invariant). calib_nodes: {panel: node array} in
-    ANCESTRY_PANELS order. Returns (admix_ind_ids, Q[n,3])."""
+    """Ancestry proportions of admixed individuals, by non-negative least squares on panel allele frequencies."""
     from scipy.optimize import nnls
     keepset = np.unique(np.concatenate([admix_nodes] + [calib_nodes[p] for p in ANCESTRY_PANELS]))
     tsa = ts.simplify(samples=keepset, filter_sites=False, filter_populations=False)
-    full2col = {int(n): k for k, n in enumerate(keepset)}       # tsa col order == keepset order
+    full2col = {int(n): k for k, n in enumerate(keepset)}       # columns follow keepset
     G = tsa.genotype_matrix()
     G = G[G.max(axis=1) <= 1]                                   # biallelic only
 
@@ -161,10 +137,7 @@ def estimate_ancestry(ts, admix_nodes, calib_nodes, rng):
 
 
 def recent_ibd(ts, cand_nodes, node_to_ind):
-    """Total recent (MRCA <= IBD_MAX_TIME gen) IBD span per individual pair, in bp.
-    Structure-free relatedness from the true ARG; uses only MRCA-time + span (both
-    preserved by simplification), never tract fine-structure. max_time < admixture
-    (12 gen) so this captures pedigree kin, not the shared admixture ancestry."""
+    """Total recent IBD span (bp) between each pair of individuals."""
     from collections import defaultdict
     ibd = ts.ibd_segments(within=list(cand_nodes), max_time=IBD_MAX_TIME,
                           min_span=IBD_MIN_SPAN, store_pairs=True, store_segments=True)
@@ -177,9 +150,7 @@ def recent_ibd(ts, cand_nodes, node_to_ind):
 
 
 def select_least_related(candidates, pair_ibd, n_keep):
-    """Relative ranking: greedily drop the individual with the most summed recent-IBD
-    to the rest until n_keep remain. Robust to estimator bias -- only needs the
-    relatedness ordering, not an absolute threshold."""
+    """Greedily drop the individual with the most recent IBD until n_keep remain."""
     keep = list(candidates)
     while len(keep) > n_keep:
         ks = set(keep)
@@ -193,17 +164,15 @@ def select_least_related(candidates, pair_ibd, n_keep):
 
 
 def select_cohort(truth, rng, log):
-    """Build the analysis cohort from the full true ARG. Returns node sets in
-    FULL-truth coordinates: EUR reference (DAC baseline), per-group target nodes,
-    the union to infer on, and per-target ancestry."""
+    """Choose the reference cohort, groups and inference sample set from the true ARG."""
     pop = {p.metadata["name"]: p.id for p in truth.populations() if p.metadata}
     eur = truth.samples(population=pop[REFERENCE_POP])
     admix = truth.samples(population=pop["ADMIX"])
 
-    ref_nodes = eur[: 2 * N_REFERENCE]                      # DAC baseline
-    control_pool = eur[2 * N_REFERENCE:]                    # disjoint pure-EUR controls
+    ref_nodes = eur[: 2 * N_REFERENCE]                      # reference cohort
+    control_pool = eur[2 * N_REFERENCE:]                    # controls, disjoint from the reference
     calib = {p: truth.samples(population=pop[p]) for p in ANCESTRY_PANELS}
-    calib[REFERENCE_POP] = eur[: 2 * N_EUR_CALIB]           # EUR freq from a reference subset
+    calib[REFERENCE_POP] = eur[: 2 * N_EUR_CALIB]           # EUR panel for ancestry estimation
 
     ids, Q, admix_inds = estimate_ancestry(truth, admix, calib, rng)
     eur_col = ANCESTRY_PANELS.index(REFERENCE_POP)
@@ -216,12 +185,12 @@ def select_cohort(truth, rng, log):
     group_nodes = {}
     group_value = {}
 
-    # control: pure EUR (non-EUR = 0)
+    # control: unadmixed EUR
     ctrl = control_pool[: 2 * N_CONTROL]
     group_nodes["control"] = np.asarray(ctrl)
     group_value["control"] = 0.0
 
-    # ADMIX grid points: closest candidates within window, then least-related n
+    # admixed groups: nearest candidates, then the least related
     for v in GRID_ADMIX:
         lab = grid_label(v)
         d = np.abs(non_eur - v)
@@ -236,7 +205,7 @@ def select_cohort(truth, rng, log):
         log.info(f"group {lab} (non-EUR~{v}): {len(cand)} candidates -> kept {len(chosen)}; "
                  f"max retained recent-IBD = {maxrel/1e6:.2f} Mb")
 
-    # source-pure: non-EUR = 1.0, AFR+ASIA in the admixture ratio (no thinning)
+    # unadmixed non-EUR: AFR and ASIA
     pure = []
     for p, k in SOURCE_PURE_COUNTS.items():
         pn = truth.samples(population=pop[p])
@@ -244,7 +213,7 @@ def select_cohort(truth, rng, log):
     group_nodes["g100"] = np.asarray(pure, dtype=np.int64)
     group_value["g100"] = 1.0
 
-    # per-target ancestry (q) for record/plot
+    # ancestry per admixed individual
     q_by_ind = {i: Q[j] for j, i in enumerate(ids)}
     target_nodes = np.unique(np.concatenate([group_nodes[g] for g in GROUPS]))
     infer_nodes = np.unique(np.concatenate([ref_nodes, target_nodes]))
@@ -256,10 +225,10 @@ def select_cohort(truth, rng, log):
 
 rule all:
     input:
-        plot = f"{OUTPUT_PREFIX}.pdf",                       # AUC composite (admixture discrimination)
-        eur = f"{OUTPUT_PREFIX}.eur_composite.pdf",          # EUR singleton bias / coverage / hexbins
-        cdf = f"{OUTPUT_PREFIX}.eur_cdfdiff.pdf",            # EUR CDF-difference vs age, single-DAC columns
-        auroc = f"{OUTPUT_PREFIX}.eur_auroc.pdf",            # EUR AUROC vs DAC, true vs inferred
+        plot = f"{OUTPUT_PREFIX}.pdf",                       # AUROC by admixture group
+        eur = f"{OUTPUT_PREFIX}.eur_composite.pdf",          # EUR singleton bias and coverage
+        cdf = f"{OUTPUT_PREFIX}.eur_cdfdiff.pdf",            # EUR CDF differences
+        auroc = f"{OUTPUT_PREFIX}.eur_auroc.pdf",            # EUR AUROC vs allele count
 
 
 rule simulate:
@@ -279,7 +248,7 @@ rule simulate:
         logging.basicConfig(filename=str(log), filemode="w", level=logging.INFO)
 
         species = stdpopsim.get_species("HomSap")
-        model = species.get_demographic_model(BASE_MODEL)   # catalog AmericanAdmixture_4B18
+        model = species.get_demographic_model(BASE_MODEL)
         contig = species.get_contig(**CONTIG, mutation_rate=MUTATION_RATE)
         dfe = species.get_dfe(DFE_ID)
         if params.exon_only:
@@ -289,7 +258,7 @@ rule simulate:
         else:
             contig.add_dfe(intervals=[[0, int(contig.length)]], DFE=dfe)
 
-        # generously sample all pops once -> a reusable "big" ARG we subsample later
+        # sample all populations once; cohorts are subsampled later
         samples = {
             REFERENCE_POP: N_REFERENCE + N_CONTROL,
             "ADMIX": N_ADMIX_POOL,
@@ -330,7 +299,7 @@ rule select:
         rng = np.random.default_rng(SEEDS[wildcards.rep])
         sel = select_cohort(truth, rng, log)
 
-        # simplify the truth down to {EUR reference + 300 targets} for tsinfer
+        # simplify to the cohort used for inference
         cohort = truth.simplify(samples=sel["infer_nodes"].tolist(),
                                 filter_populations=False)
         tszip.compress(cohort, output.cohort)
@@ -354,9 +323,7 @@ rule infer:
         import logging
         logging.basicConfig(filename=str(log), filemode="w", level=logging.INFO)
 
-        # SLiM tree sequences carry struct-codec metadata schemas, but tsinfer only
-        # accepts the JSON codec. None of it is needed for inference (selection/origin
-        # come from the truth ts in the mutations rule), so strip schemas + metadata.
+        # tsinfer needs JSON metadata, and SLiM metadata isn't needed for inference
         tables = tszip.load(input.trees).dump_tables()
         null = tskit.MetadataSchema.null()
         tables.metadata_schema = null
@@ -398,7 +365,7 @@ rule date:
 
 rule mutations:
     input:
-        cohort = rules.select.output.cohort,   # the frozen ground-truth ARG (15k ref + 300 targets)
+        cohort = rules.select.output.cohort,   # true ARG for the cohort
         dated = rules.date.output.trees,
         meta = rules.select.output.meta,
     output:
@@ -408,13 +375,12 @@ rule mutations:
         import tskit
         import tszip
 
-        # true ages are read from the SAME cohort the inferred ARG was built from,
-        # so true-vs-inferred midpoints are on one genealogy (same sample set).
+        # true ages come from the same cohort as the inferred ARG
         truth = tszip.load(input.cohort)
         dated = tszip.load(input.dated)
         sel = pickle.load(open(input.meta, "rb"))
 
-        # map biallelic sites of the inferred (dated) ARG to a dense index
+        # index the biallelic sites of the dated ARG
         muts_per_site = np.bincount(dated.mutations_site, minlength=dated.num_sites)
         biallelic = np.flatnonzero(muts_per_site == 1)
         position_map = {dated.sites_position[s]: i for i, s in enumerate(biallelic)}
@@ -423,7 +389,7 @@ rule mutations:
         for pos, i in position_map.items():
             positions[i] = pos
 
-        # --- inferred age: midpoint of the mutation's edge in the dated ARG ----
+        # inferred age: midpoint of the mutation's edge
         inferred_age = np.full(n, np.nan)
         for t in dated.trees():
             for m in t.mutations():
@@ -433,7 +399,7 @@ rule mutations:
                     inferred_age[position_map[pos]] = (
                         dated.nodes_time[p] + dated.nodes_time[c]) / 2
 
-        # --- truth: selection coefficient + mutation type per site -------------
+        # selection coefficient and mutation type per site
         site_sel = np.zeros(truth.num_sites)
         site_mtype = np.full(truth.num_sites, -1, dtype=np.int64)
         for site in truth.sites():
@@ -444,18 +410,16 @@ rule mutations:
                     site_sel[site.id] = ml[0].get("selection_coeff", 0.0)
                     site_mtype[site.id] = ml[0].get("mutation_type", -1)
                     break
-        site_sel /= SLIM_SCALING  # SLiM stores s * Q; recover the true coefficient
+        site_sel /= SLIM_SCALING  # SLiM stores s * Q
 
-        # --- cohort node sets, mapped to cohort-ARG coordinates ----------------
-        # select stored node ids in full-truth coords; the cohort ARG renumbered its
-        # samples to match infer_nodes order, so searchsorted maps full -> cohort.
+        # node ids -> cohort-ARG ids (cohort samples are in infer_nodes order)
         inf = sel["infer_nodes"]
-        cohort_nodes = np.searchsorted(inf, sel["reference_nodes"])           # EUR reference, DAC baseline
+        cohort_nodes = np.searchsorted(inf, sel["reference_nodes"])           # EUR reference
         group_nodes = {g: np.searchsorted(inf, v) for g, v in sel["group_nodes"].items()}
 
-        # --- one truth pass (reference-tracked): true ages, origin, ref count ---
-        true_age = np.full(n, np.nan)           # exact age-on-branch (mutations_time)
-        true_midpoint = np.full(n, np.nan)      # midpoint of the true edge (matches estimand)
+        # true ages, population of origin, and allele count in the reference
+        true_age = np.full(n, np.nan)           # exact mutation age
+        true_midpoint = np.full(n, np.nan)      # midpoint of the true edge
         origin = np.full(n, -1, dtype=np.int64)
         reference_count = np.zeros(n, dtype=np.int64)
         for t in truth.trees(tracked_samples=cohort_nodes):
@@ -478,14 +442,12 @@ rule mutations:
                 selection[i] = site_sel[sid]
                 mutation_type[i] = site_mtype[sid]
 
-        # forward-phase vs recapitation: drop the recap-overlay neutrals that sit
-        # entirely above the deepest selected mutation (compare neutral & deleterious
-        # over the same forward-simulated age range).
+        # drop neutral mutations older than the oldest selected one (from recapitation)
         selected = np.abs(selection) > 0
         boundary = float(np.nanmax(true_age[selected])) if selected.any() else np.inf
         forward_phase = np.nan_to_num(true_age, nan=np.inf) <= boundary
 
-        # --- one truth pass per group: carrier membership of the targets ------
+        # which groups carry each mutation
         carriers = {}
         for name, nodes in group_nodes.items():
             carried = np.zeros(n, dtype=bool)
@@ -519,8 +481,8 @@ rule mutations:
 
 rule auc_data:
     input:
-        cohort = rules.select.output.cohort,   # frozen ground-truth ARG (true ages, selection, origin)
-        dated = rules.date.output.trees,       # inferred + dated ARG (inferred ages)
+        cohort = rules.select.output.cohort,   # true ARG
+        dated = rules.date.output.trees,       # inferred, dated ARG
         meta = rules.select.output.meta,
     output:
         data = os.path.join(TREES_DIR, "{rep}.auc.pkl"),
@@ -533,20 +495,20 @@ rule auc_data:
         sel = pickle.load(open(input.meta, "rb"))
         inf = sel["infer_nodes"]
 
-        # target nodes (cohort coords) tagged by group index, for the per-site group bitmask
+        # target nodes (cohort ids) and their group index
         tnodes, gidx = [], []
         for gi, g in enumerate(GROUPS):
             for nd in np.searchsorted(inf, sel["group_nodes"][g]):
                 tnodes.append(int(nd)); gidx.append(gi)
         tnodes = np.array(tnodes); gidx = np.array(gidx)
 
-        # --- truth pass: true child/parent node times, cohort allele count, origin, |s| ---
+        # true ARG: branch times, allele count, origin and |s| per site
         nt, ep, ec = truth.nodes_time, truth.edges_parent, truth.edges_child
         S = truth.num_sites
         site_sel = np.zeros(S)
-        tct = np.full(S, np.nan); tpt = np.full(S, np.nan)   # true child / parent node times
-        dac = np.zeros(S, np.int64)                          # derived-allele count in the cohort
-        orig = np.full(S, -1, np.int64)                      # SLiM subpopulation of origin
+        tct = np.full(S, np.nan); tpt = np.full(S, np.nan)   # true child/parent node times
+        dac = np.zeros(S, np.int64)                          # derived allele count in the cohort
+        orig = np.full(S, -1, np.int64)                      # population of origin
         for t in truth.trees():
             for m in t.mutations():
                 md = m.metadata
@@ -559,13 +521,13 @@ rule auc_data:
                     site_sel[m.site] = abs(ml[0].get("selection_coeff", 0.0))
         site_sel /= SLIM_SCALING                             # SLiM stores s * Q
 
-        # biallelic + forward-phase (drop recap neutrals above the deepest selected mutation)
+        # biallelic sites, excluding recapitated neutral mutations
         bi = np.bincount(truth.mutations_site, minlength=S) == 1
         mid = (tct + tpt) / 2
         boundary = np.nanmax(mid[(site_sel > 0) & bi])
         forward = np.nan_to_num(mid, nan=np.inf) <= boundary
 
-        # --- inferred pass: dated child/parent node times, keyed by position ---
+        # inferred ARG: branch times, by position
         dated = tszip.load(input.dated)
         dnt, dep, dec = dated.nodes_time, dated.edges_parent, dated.edges_child
         cpos = {}
@@ -577,7 +539,7 @@ rule auc_data:
         iac = np.array([cpos.get(p, (np.nan, np.nan))[0] for p in truth.sites_position])
         iap = np.array([cpos.get(p, (np.nan, np.nan))[1] for p in truth.sites_position])
 
-        # per-site group membership bitmask (which groups carry the derived allele)
+        # bitmask of the groups carrying each site
         mask = bi & forward & (dac >= 1) & (dac <= 10) & np.isfinite(tct) & (tpt > tct)
         gmask = np.zeros(S, np.int16)
         for var in truth.variants(samples=tnodes, isolated_as_missing=False):
@@ -647,7 +609,7 @@ rule plot_auc:
         import matplotlib.pyplot as plt
         from scipy.stats import mannwhitneyu
 
-        # pool per-site arrays across replicates
+        # pool replicates
         keys = ["DAC", "SEL", "GM", "ORIG", "TAC", "TAP", "IAC", "IAP"]
         raw = {k: [] for k in keys}
         for path in input.data:
@@ -665,7 +627,7 @@ rule plot_auc:
             if dd.size < 1 or sn.size < 1: return np.nan
             return np.mean((sn.size - np.searchsorted(sn, dd, side="right")) / sn.size)
 
-        # AUC(s_min) curves: per tree type, per AC stratum, per admixture group
+        # AUROC(s_min) per tree, allele count and group
         AUC = {}
         for tree, ACa, APa in [("true", raw["TAC"], raw["TAP"]), ("inf", raw["IAC"], raw["IAP"])]:
             AUC[tree] = {}
@@ -678,19 +640,19 @@ rule plot_auc:
                         AUC[tree][lab][g] = np.full(len(TS), np.nan); continue
                     ad = rng.uniform(ACa[cell, None], APa[cell, None], size=(cell.size, AUC_AGE_DRAWS)).ravel()
                     ab = np.repeat(raw["SEL"][cell], AUC_AGE_DRAWS); abss = raw["SEL"][cell]
-                    curve = []                                # partition: del=|s|>s_min vs background=|s|<=s_min
+                    curve = []                                # deleterious: |s| > s_min
                     for s in TS:
                         nd = int((abss > s).sum()); nbg = int((abss <= s).sum())
                         curve.append(fast_auc(ad[ab > s], np.sort(ad[ab <= s]))
                                      if nd >= AUC_MIN_MUT and nbg >= AUC_MIN_MUT else np.nan)
                     AUC[tree][lab][g] = np.array(curve)
 
-        # === assemble composite (2 rows x [left single panel | spacer | 3-panel block]) ===
+        # layout: 2 rows of [single panel | spacer | 3 panels]
         fig = plt.figure(figsize=(9.4, 5.1), layout="constrained")
         fig.get_layout_engine().set(w_pad=0.02, h_pad=0.02, wspace=0.0, hspace=0.06)
-        gs = fig.add_gridspec(2, 5, width_ratios=[1.3, 0.15, 1, 1, 1])   # col 1 = spacer
+        gs = fig.add_gridspec(2, 5, width_ratios=[1.3, 0.15, 1, 1, 1])   # column 1 is a spacer
 
-        # (A) ancestry simplex + shared non-EUR colorbar
+        # (A) ancestry simplex
         axa = fig.add_subplot(gs[0, 0])
         axa.plot([0, 1, 0.5, 0], [0, 0, h, 0], "k-", lw=1.2, zorder=1, clip_on=False)
         sc = axa.scatter(ANC["x"], ANC["y"], c=ANC["nonEUR"], cmap="turbo", s=4, edgecolors="none", zorder=3, clip_on=False, rasterized=True)
@@ -706,13 +668,13 @@ rule plot_auc:
         cb.set_label("non-EUR ancestry", fontsize=7); cb.ax.tick_params(labelsize=6)
         axa.set_title("A.", loc="left", fontweight="bold", fontsize=12)
 
-        # (B) age-distribution illustration histogram (one representative cell)
+        # (B) age distributions for one group and allele count
         axb = fig.add_subplot(gs[1, 0])
         bit = 1 << GROUPS.index(AUC_HIST_GROUP)
         cell = ((raw["DAC"] == AUC_HIST_DAC) & ((raw["GM"] & bit) > 0)
                 & np.isfinite(raw["TAC"]) & (raw["TAP"] > raw["TAC"]))
-        rng = np.random.default_rng(0)   # dedicated seed for panel B (order-independent of the curve draws)
-        def ages(m): return rng.uniform(raw["TAC"][m], raw["TAP"][m])   # branch-integrated age (matches C/D)
+        rng = np.random.default_rng(0)   # separate seed for panel B
+        def ages(m): return rng.uniform(raw["TAC"][m], raw["TAP"][m])   # age drawn uniformly along the branch
         dele = ages(cell & (raw["SEL"] > AUC_HIST_CUT)); neut = ages(cell & (raw["SEL"] <= AUC_HIST_CUT))
         auc = 1 - mannwhitneyu(dele, neut).statistic / (dele.size * neut.size)
         ln, ld = np.log10(neut), np.log10(dele)
@@ -736,7 +698,7 @@ rule plot_auc:
                  transform=axb.transAxes, ha="center", va="top", fontsize=7.5)
         axb.set_title("B.", loc="left", fontweight="bold", fontsize=12)
 
-        # (C) True ARG and (D) Inferred ARG: AUC(s_min) per AC stratum, shared x/y per row
+        # (C, D) AUROC(s_min) per allele count, true and inferred ARG
         COLS = [lab for lab, _, _ in AUC_DAC_COLS]
         for r, (tree, letter, treelab) in enumerate([("true", "C.", "True ARG"), ("inf", "D.", "Inferred ARG")]):
             rbase = None; row_axes = []
@@ -759,7 +721,7 @@ rule plot_auc:
 
 rule eur_coverage_data:
     input:
-        cohort = rules.select.output.cohort,       # frozen true ARG (ages, selection)
+        cohort = rules.select.output.cohort,       # true ARG
         meta = rules.select.output.meta,
         infer = rules.infer.output.trees,          # tsinfer topology (undated)
     output:
@@ -773,7 +735,7 @@ rule eur_coverage_data:
         widths = COV_WIDTHS
         lq = (1 - widths) / 2; uq = 1 - lq
 
-        def true_site_arrays(ts):              # first-mutation per site: child/parent time, exact age, DAC, |s|
+        def true_site_arrays(ts):              # per site: branch times, exact age, allele count, |s|
             nt, ep, ec, mt = ts.nodes_time, ts.edges_parent, ts.edges_child, ts.mutations_time
             S = ts.num_sites
             sel = np.zeros(S); tc = np.full(S, np.nan); tp = np.full(S, np.nan)
@@ -788,7 +750,7 @@ rule eur_coverage_data:
             sel /= SLIM_SCALING
             return sel, tc, tp, tage, dac
 
-        def strip(ts):                         # drop SLiM struct metadata schemas (after |s|/ages are read)
+        def strip(ts):                         # drop SLiM metadata schemas
             tb = ts.dump_tables(); null = tskit.MetadataSchema.null()
             tb.metadata_schema = null; tb.metadata = b""
             for t in (tb.populations, tb.individuals, tb.nodes, tb.sites, tb.mutations):
@@ -796,8 +758,7 @@ rule eur_coverage_data:
             return tb.tree_sequence()
 
         def date_and_ci(ts_topo, preprocess, posmap, n, seed):
-            """tsdate a topology, then per-singleton credible intervals (Monte Carlo over gamma node
-            posteriors: age ~ Uniform(t_child, t_parent), conditioned on t_parent > t_child) + midpoint."""
+            """Date a topology; return per-site credible intervals and edge midpoints."""
             ts2 = tsdate.preprocess_ts(ts_topo) if preprocess else ts_topo
             dated, fit = tsdate.date(ts2, mutation_rate=MUTATION_RATE, max_iterations=EP_ITERATIONS,
                                      rescaling_iterations=RESCALING_ITERATIONS, rescaling_intervals=RESCALING_INTERVALS,
@@ -824,7 +785,7 @@ rule eur_coverage_data:
             for s in range(0, valid.size, CH):
                 idx = valid[s:s + CH]; k = idx.size
                 cmv, cvv, pmv, pvv = cm[idx], cv[idx], pm[idx], pv[idx]
-                tc_ = np.zeros((k, COV_NMC)); free = cvv > 0   # child = leaf -> fixed at 0 for singletons
+                tc_ = np.zeros((k, COV_NMC)); free = cvv > 0   # a singleton's child is a sample, fixed at 0
                 if free.any():
                     sc, rc = cmv[free] ** 2 / cvv[free], cmv[free] / cvv[free]
                     tc_[free] = rng.gamma(sc[:, None], 1 / rc[:, None], size=(int(free.sum()), COV_NMC))
@@ -838,7 +799,7 @@ rule eur_coverage_data:
 
         ri = REPS.index(wildcards.rep)
         sel_meta = pickle.load(open(input.meta, "rb")); inf = sel_meta["infer_nodes"]
-        ref_cols = np.searchsorted(inf, sel_meta["reference_nodes"]).tolist()   # EUR reference (cohort coords)
+        ref_cols = np.searchsorted(inf, sel_meta["reference_nodes"]).tolist()   # EUR reference (cohort ids)
         eu = tszip.load(input.cohort).simplify(samples=ref_cols)
         sel, tct, tpt, tage, dac = true_site_arrays(eu)
         bi = np.bincount(eu.mutations_site, minlength=eu.num_sites) == 1
@@ -848,9 +809,9 @@ rule eur_coverage_data:
         pos = eu.sites_position[sidx]; n = pos.size
         posmap = {p: i for i, p in enumerate(pos)}
 
-        lo_s, up_s, imid_s = date_and_ci(strip(eu), False, posmap, n, 100 + ri)   # true topology + tsdate
+        lo_s, up_s, imid_s = date_and_ci(strip(eu), False, posmap, n, 100 + ri)   # true topology
         topo = tszip.load(input.infer).simplify(samples=ref_cols)
-        lo_i, up_i, imid_i = date_and_ci(topo, True, posmap, n, 200 + ri)         # tsinfer topology + tsdate
+        lo_i, up_i, imid_i = date_and_ci(topo, True, posmap, n, 200 + ri)         # inferred topology
 
         pickle.dump(dict(SEL=sel[sidx], TAGE=tage[sidx], TMID=tmid[sidx],
                          IMID_SIM=imid_s, IMID_INF=imid_i,
@@ -864,8 +825,7 @@ rule plot_eur_composite:
     output:
         plot = f"{OUTPUT_PREFIX}.eur_composite.pdf",
     run:
-        # Manual axes placement: A/B = 4 panels + spacer, C = 5 hexbins; leftmost/rightmost spines aligned.
-        # (matplotlib's auto layout managers collapse on the mixed-column grid this needs.)
+        # axes are placed manually
         import pickle
         import matplotlib
         matplotlib.use("Agg")
@@ -881,7 +841,7 @@ rule plot_eur_composite:
         IMID_SIM, IMID_INF = D["IMID_SIM"], D["IMID_INF"]
         LO_SIM, UP_SIM, LO_INF, UP_INF, WIDTHS = D["LOWER_SIM"], D["UPPER_SIM"], D["LOWER_INF"], D["UPPER_INF"], COV_WIDTHS
         rng = np.random.default_rng(0)
-        TAGE = TAGE.copy(); TAGE[SEL > 0] += rng.uniform(0, 1, int((SEL > 0).sum()))   # de-discretize SLiM ages
+        TAGE = TAGE.copy(); TAGE[SEL > 0] += rng.uniform(0, 1, int((SEL > 0).sum()))   # jitter SLiM's integer ages
         CORR = 2.0 / np.e
         EDGES = COV_SGRID; MINN = COV_MINN
 
@@ -900,7 +860,7 @@ rule plot_eur_composite:
         for pair in (aA, aB):
             pair[1].sharex(pair[0]); pair[1].sharey(pair[0])
 
-        # --- Group A: bias vs |s| ---
+        # (A) bias vs |s|
         for col, mid in enumerate([IMID_SIM, IMID_INF]):
             a = aA[col]
             for mname, ref, mult, color in [("vs true age", TAGE, CORR, "tab:green"),
@@ -924,7 +884,7 @@ rule plot_eur_composite:
                 a.tick_params(labelleft=False)
         aA[0].set_ylim(bottom=-0.06)
 
-        # --- Group B: coverage ---
+        # (B) coverage
         for col, (lo, up) in enumerate([(LO_SIM, UP_SIM), (LO_INF, UP_INF)]):
             a = aB[col]
             for sname, sm, color in [(r"$|s|<10^{-5}$", SEL < 1e-5, "dodgerblue"),
@@ -949,7 +909,7 @@ rule plot_eur_composite:
         fig.text(L + PW + IG / 2, BAB - 0.06, r"Selection coefficient $|s|$", ha="center", va="top", fontsize=8.5)
         fig.text(L + 3 * PW + 1.5 * IG + SW, BAB - 0.06, "Expected coverage (true mutation age)", ha="center", va="top", fontsize=8.5)
 
-        # --- Group C: hexbins of corrected inferred midpoint vs true mutation age, across |s| bins ---
+        # (C) inferred vs true age, by |s| bin
         EDGES_C = COV_EDGES_C
         def _edge(v):
             if v == 0: return "0"
@@ -983,9 +943,9 @@ rule plot_eur_composite:
 
 rule eur_cdfdiff_data:
     input:
-        cohort = rules.select.output.cohort,       # true ARG (ages, selection)
+        cohort = rules.select.output.cohort,       # true ARG
         meta = rules.select.output.meta,
-        dated = rules.date.output.trees,           # full-cohort dated ARG (inferred ages)
+        dated = rules.date.output.trees,           # inferred, dated ARG
     output:
         data = os.path.join(TREES_DIR, "{rep}.eur_cdfdiff.pkl"),
     run:
@@ -993,7 +953,7 @@ rule eur_cdfdiff_data:
         import tskit
         import tszip
 
-        def site_arrays(ts):                       # first-mutation per site: child/parent time, EUR-DAC, |s|
+        def site_arrays(ts):                       # per site: branch times, EUR allele count, |s|
             nt, ep, ec = ts.nodes_time, ts.edges_parent, ts.edges_child
             S = ts.num_sites
             sel = np.zeros(S); tc = np.full(S, np.nan); tp = np.full(S, np.nan); dac = np.zeros(S, np.int64)
@@ -1007,14 +967,14 @@ rule eur_cdfdiff_data:
             return sel, tc, tp, dac
 
         sel_meta = pickle.load(open(input.meta, "rb")); inf = sel_meta["infer_nodes"]
-        ref_cols = np.searchsorted(inf, sel_meta["reference_nodes"]).tolist()   # EUR reference (cohort coords)
+        ref_cols = np.searchsorted(inf, sel_meta["reference_nodes"]).tolist()   # EUR reference (cohort ids)
         eu = tszip.load(input.cohort).simplify(samples=ref_cols)
         sel, tct, tpt, dac = site_arrays(eu)
         bi = np.bincount(eu.mutations_site, minlength=eu.num_sites) == 1
         mid = (tct + tpt) / 2
         boundary = np.nanmax(mid[(sel > 0) & bi]); forward = np.nan_to_num(mid, nan=np.inf) <= boundary
 
-        eui = tszip.load(input.dated).simplify(samples=ref_cols)   # full-cohort dated ARG -> EUR
+        eui = tszip.load(input.dated).simplify(samples=ref_cols)   # dated ARG, EUR samples only
         dnt, dep, dec = eui.nodes_time, eui.edges_parent, eui.edges_child
         cpos = {}
         for tr in eui.trees():
@@ -1057,7 +1017,7 @@ rule plot_eur_cdfdiff:
             i = np.where(mask)[0]
             if i.size > NCAP: i = rng.choice(i, NCAP, replace=False)
             tc, tp = ac[i], ap[i]
-            return np.clip((TGRID[:, None] - tc[None, :]) / (tp - tc)[None, :], 0, 1).mean(1)   # analytic uniform-branch CDF
+            return np.clip((TGRID[:, None] - tc[None, :]) / (tp - tc)[None, :], 0, 1).mean(1)   # CDF with ages uniform along each branch
 
         cmap = plt.cm.plasma
         cols = [cmap(x) for x in np.linspace(0.05, 0.9, len(SCUTS))]
@@ -1070,7 +1030,7 @@ rule plot_eur_cdfdiff:
             for ci, ((lo, hi), lab) in enumerate(zip(BINS, BLAB)):
                 ax = fig.add_subplot(gs[r, ci], sharex=rbase, sharey=rbase); rbase = rbase or ax
                 inbin = rowok & (DAC >= lo) & (DAC <= hi)
-                for sc, col in zip(SCUTS, cols):           # partition: del=|s|>s_cut vs background=|s|<=s_cut
+                for sc, col in zip(SCUTS, cols):           # deleterious: |s| > s_cut
                     de = inbin & (SEL > sc); bg = inbin & (SEL <= sc)
                     if de.sum() < MINMUT or bg.sum() < MINMUT: continue
                     ax.plot(TGRID, cdf(AcA, ApA, de) - cdf(AcA, ApA, bg), "-", color=col, lw=1.6)
@@ -1095,7 +1055,7 @@ rule plot_eur_cdfdiff:
 
 rule plot_eur_auroc:
     input:
-        data = expand(rules.eur_cdfdiff_data.output.data, rep=REPS),   # reuses EUR per-site arrays
+        data = expand(rules.eur_cdfdiff_data.output.data, rep=REPS),   # same per-site data as plot_eur_cdfdiff
     output:
         plot = f"{OUTPUT_PREFIX}.eur_auroc.pdf",
     run:
@@ -1117,7 +1077,7 @@ rule plot_eur_auroc:
             if dd.size < 1 or sn.size < 1: return np.nan
             return np.mean((sn.size - np.searchsorted(sn, dd, side="right")) / sn.size)
 
-        # ---- (C) AUROC(s_min) vs DAC, true / inferred ARG ----
+        # (C) AUROC(s_min) vs allele count, true and inferred ARG
         rngC = np.random.default_rng(0)
 
         def auroc_for_tree(ac, ap):
@@ -1138,10 +1098,10 @@ rule plot_eur_auroc:
 
         RES = {"True ARG": auroc_for_tree(TAC, TAP), "Inferred ARG": auroc_for_tree(IAC, IAP)}
 
-        # ---- (A,B) illustrative single-DAC panels on the TRUE ARG ----
+        # (A, B) single allele count, true ARG
         rngAB = np.random.default_rng(0)
 
-        def auroc_curve(dac):                                  # AUROC(s_min) over AUROC_SGRID, one DAC
+        def auroc_curve(dac):                                  # AUROC(s_min) for one allele count
             ii = np.where(np.isfinite(TAC) & (TAP > TAC) & (DAC == dac))[0]
             s = SEL[ii]; ad = rngAB.uniform(TAC[ii][:, None], TAP[ii][:, None], size=(ii.size, AUROC_R))
             return np.array([fast_auc(ad[s > sm].ravel(), np.sort(ad[s <= sm].ravel()))
@@ -1150,13 +1110,13 @@ rule plot_eur_auroc:
 
         ii = np.where(np.isfinite(TAC) & (TAP > TAC) & (DAC == AUROC_DACSEL))[0]
         sel = SEL[ii]
-        age = rngAB.uniform(TAC[ii], TAP[ii])                  # one branch-integrated draw per mutation (cloud/marginal)
+        age = rngAB.uniform(TAC[ii], TAP[ii])                  # one age draw per mutation
         adraw = rngAB.uniform(TAC[ii][:, None], TAP[ii][:, None], size=(ii.size, AUROC_R))
         auc = auroc_curve(AUROC_DACSEL)
         _d0 = sel > AUROC_SMIN_LINE
         auc_at_line = fast_auc(adraw[_d0].ravel(), np.sort(adraw[~_d0].ravel()))
         auc_other = {dac: auroc_curve(dac) for dac in AUROC_OTHER_DACS}
-        sval = np.maximum(sel, AUROC_FLOOR_S)                  # |s| floored (neutral -> bottom band on log axis)
+        sval = np.maximum(sel, AUROC_FLOOR_S)                  # floor |s| for the log axis
         delet = sel > AUROC_SMIN_LINE; bgm = ~delet
         COL_D, COL_B = "firebrick", "dodgerblue"
 
@@ -1168,24 +1128,23 @@ rule plot_eur_auroc:
             return rf"$|s| > 10^{{{es}}}$"
         labels = [slabel(sm) for sm in AUROC_SPLITS]
 
-        # ---- combined figure: illustrative pair (A,B) above the production AUROC-vs-DAC pair (C) ----
-        # Manual fig.add_axes throughout (the constrained/compressed solver collapses on this mixed grid).
+        # axes are placed manually
         fig = plt.figure(figsize=(6.075, 5.6))
         Lm, Rm = 0.10, 0.02
-        SW = 0.125                                             # top-row inter-panel spacer
+        SW = 0.125                                             # top-row gap
         COLW = (1 - Lm - Rm - SW) / 2
         xA = Lm + COLW + SW
-        CSW = 0.02                                             # bottom-row inter-panel gap
+        CSW = 0.02                                             # bottom-row gap
         CCOLW = (1 - Lm - Rm - CSW) / 2
         xCR = Lm + CCOLW + CSW
-        BmC, HC = 0.105, 0.295                                 # C panels bottom / height (extra bottom room for x-label)
-        legY = 0.45                                            # C legend anchor (just above C panels)
-        HJ, HM, GAP = 0.244, 0.092, 0.025                      # top-row joint height (~80%); marginal height; gap
-        ytopT = 0.975                                          # top of the marginal panel (minimal top margin)
+        BmC, HC = 0.105, 0.295                                 # panel C bottom and height
+        legY = 0.45                                            # panel C legend position
+        HJ, HM, GAP = 0.244, 0.092, 0.025                      # panel A heights and gap
+        ytopT = 0.975                                          # top of the panel A marginal
         BmT = ytopT - HJ - GAP - HM
         cx = (Lm + (1 - Rm)) / 2
 
-        # (A) joint (age, |s|) cloud + top marginal
+        # (A) age vs |s|, with marginal histograms
         axJ = fig.add_axes([Lm, BmT, COLW, HJ])
         axM = fig.add_axes([Lm, BmT + HJ + GAP, COLW, HM], sharex=axJ)
         axJ.scatter(age[bgm], sval[bgm], s=4, color=COL_B, alpha=0.25, edgecolors="none", rasterized=True)
