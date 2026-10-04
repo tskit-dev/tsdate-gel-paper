@@ -37,3 +37,14 @@ The methods are implemented in [tsdate](https://github.com/tskit-dev/tsdate) and
 
 The code in this repository is released under the MIT licence (see `LICENSE`), except for
 `tsinfer-snakemake`, which is distributed under its own MIT licence.
+
+The following data files come from published work. They are included with attribution and are not
+covered by the MIT licence:
+
+- `data/Phlash_fig7b.csv`: PHLASH population size estimates from Terhorst (2025), _Nature Genetics_
+  57:2570–2577, https://doi.org/10.1038/s41588-025-02323-x; included with the author's permission.
+- `data/chr17inversion/chr17q21.31_time_plot.csv`: Relate-based age estimates for the 17q21.31
+  inversion from Ignatieva et al. (2025), _Molecular Biology and Evolution_ 42:msaf190,
+  https://doi.org/10.1093/molbev/msaf190 (also available at https://github.com/a-ignatieva/dolores-paper).
+- `data/chr17inversion/donnelly_et_al_table_2.csv`: 17q21 inversion marker SNPs from Table 2 of
+  Donnelly et al. (2010), _American Journal of Human Genetics_ 86:161–171.
