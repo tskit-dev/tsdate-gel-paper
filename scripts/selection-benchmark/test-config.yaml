@@ -1,0 +1,53 @@
+output-prefix: "admix-test"
+trees-dir: "/sietch_colab/data_share/natep/gel-dating-paper/selection-benchmark/admix-test"
+random-seed: 1024
+
+# tsdate
+ep-iterations: 10
+rescaling-iterations: 3
+rescaling-intervals: 10000
+min-branch-length: 1.0e-8
+threads-per-job: 8
+
+# forward simulation (SLiM) -- small/scaled: fast end-to-end pipeline test only.
+# NB scaling distorts the (12-gen) admixture gradient; this config validates the
+# WIRING, not the science. Use full-config.yaml (Q=1) for real results.
+base-model: "AmericanAdmixture_4B18"
+dfe: "Gamma_K17"
+mutation-rate: 2.36e-8
+slim-scaling: 10
+slim-burn-in: 1
+slim-path: "/home/natep/miniconda3/bin/slim"
+
+# cohort design (small)
+reference-pop: "EUR"
+ancestry-panels: ["AFR", "EUR", "ASIA"]
+n-reference: 500
+n-control: 20
+n-admix-pool: 1000
+n-panel: 100
+n-eur-calib: 200
+
+grid-admix: [0.2, 0.4, 0.6, 0.8]
+n-per-group: 10
+n-candidates: 40
+grid-window: 0.15          # wide (scaling distorts the gradient)
+source-pure-counts:
+    AFR: 3
+    ASIA: 7
+n-sites-ancestry: 5000
+
+ibd-max-time: 6.0
+ibd-min-span: 200000
+
+max-freq: 0.01
+age-filter: 1000.0
+del-threshold: 1.0e-3
+
+replicates: 1
+
+contig:
+    chromosome: "chr17"
+    genetic_map: "HapMapII_GRCh38"
+    left: 42.0e+6
+    right: 52.0e+6         # 10 Mb test window

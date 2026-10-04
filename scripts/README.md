@@ -1,4 +1,4 @@
-This folder contains all the code used to generate figures in the manuscript that rely on simulated or publicly available data.
+This folder contains all the code used to generate figures in the manuscript that rely on simulated or publicly available data. Figure and table numbers below refer to the published paper ("ED" = Extended Data; "S" = Supplementary Information).
 
 # Requirements
 
@@ -12,17 +12,30 @@ An R installation is also needed to produce one table (Table S8) as discussed be
 
 # Snakemake pipelines
 
-Each pipeline has its own folder in this directory. If all the input and output paths are correctly configured for your machine, each can be run with the `snakemake --cores all` command.
+Each pipeline has its own folder in this directory, with its own conda `environment.yaml`. Before running, edit the `trees-dir` (and, where present, `slim-path`) entries in `full-config.yaml` to point to locations on your machine. Each pipeline can then be run with the `snakemake --cores all` command.
 
-* `stdpopsim-benchmarks`: Compares accuracy of variational gamma (VG) and inside-outside (IO) algorithms of `tsdate` (Figure S1).
-* `performance-benchmarks`: Computational performance evaluation of dating method (Figure S2).
-* `convergence-benchmark`: Uses simulated data to evaluate `tsdate` convergence, as shown in Figure S3.
-* `uncertainty-benchmarks`: Analyses the calibration of `tsdate` VG posteriors (Figure S4).
-* `tgp_comparison`: Compares allele age estimates from five methods on chr20 of the 1KGP data (Figure S10). Requires ~18 GB of data obtained from various sources. Please contact us if you'd like to run this analysis and we would be happy to assist.
+* `stdpopsim-benchmarks`: Compares accuracy of variational gamma (VG) and inside-outside (IO) algorithms of `tsdate` (ED Fig. 1, Table S1).
+* `performance-benchmarks`: Computational performance evaluation of dating method (ED Fig. 2).
+* `uncertainty-benchmarks`: Analyses the calibration of `tsdate` VG posteriors (ED Fig. 3).
+* `selection-benchmark`: Forward simulations (SLiM, via stdpopsim) with direct and background selection, evaluating dating accuracy for singletons under selection, and how informative variant ages are about deleteriousness as a function of sample admixture and allele frequency (ED Figs. 4, 7 and 10).
+* `convergence-benchmarks`: Uses simulated data to evaluate `tsdate` convergence (Fig. S1).
+* `tgp_comparison`: Compares allele age estimates from five methods on chr20 of the 1KGP data (Fig. S9). Requires ~18 GB of data obtained from various sources; the `bcftools` script used to extract singletons from the unphased VCFs is not included. Please contact us if you'd like to run this analysis and we would be happy to assist.
+
+The pipelines write their plots inside their own folder. These correspond to the figures in the paper as follows:
+
+| Pipeline output | Figure |
+|---|---|
+| `stdpopsim-benchmarks/full.pdf` | ED Fig. 1 |
+| `performance-benchmarks/full.benchmark.pdf` | ED Fig. 2 |
+| `uncertainty-benchmarks/full.pdf` | ED Fig. 3 |
+| `selection-benchmark/admix-full.eur_composite.pdf` | ED Fig. 4 |
+| `selection-benchmark/admix-full.pdf` | ED Fig. 7 |
+| `selection-benchmark/admix-full.eur_auroc.pdf` | ED Fig. 10 |
+| `convergence-benchmarks/full.pdf` | Fig. S1 |
 
 # Makefile for sampling simulation
 
-One Makefile was created (`base_dir/makefiles/sampling_sim.mk`) to produce the large intermediate data files that are needed to make Table S8 and Figure S11. To run it from the base directory:
+One Makefile was created (`base_dir/makefiles/sampling_sim.mk`) to produce the large intermediate data files that are needed to make Table S8 and ED Fig. 6. To run it from the base directory:
 
 ```
 cd tools && make #from base directory
@@ -38,19 +51,19 @@ The same result can also be recreated more laboriously using these separate scri
 # Dating external trees
 
 * `perf_sim_tsdate.py` uses tsdate to date the simulated chr17 from [Anderson-Trocme et al](https://www.science.org/doi/abs/10.1126/science.add5300) (https://zenodo.org/records/7702392)
-* `validation_real_tsdate.py` uses tsdate to date a portion of inferred 1KGP ARGs for chr20 (will be uploaded to Zenodo)
+* `validation_real_tsdate.py` uses tsdate to date a portion of the inferred 1KGP ARGs for chr20. The ARGs are available from Zenodo (https://doi.org/10.5281/zenodo.23086785) and should be placed in `data/tgp/` (see `data/tgp/README.md`).
 
 # Combined CLI scripts for data generation and plotting
 
-The `make_figure_data.py` script makes various datasets in compressed `csv.zst` format that are needed for the plots. The compressed files are included in the repository but can be regenerated as follows (for what they relate to, see their corresponding plot commands):
+The `make_figure_data.py` script (with helper functions in `make_tgp_data.py`) makes various datasets in compressed `csv.zst` format that are needed for the plots. The compressed files are included in the repository but can be regenerated as follows (for what they relate to, see their corresponding plot commands):
 
 * `make_figure_data.py pedigree_sim`: Requires the data generated by `perf_sim_tsdate.py` above.
 * `make_figure_data.py sampling_sim`: Requires the data generated by the Makefile above.
-* `make_figure_data.py validation_aDNA 20`: The 20 argument specifies the chromosome, which defaults to chr20. Require the Makefile in `data/aDNA` and inferred 1KGP ARGs for chr20 to be run. The inferred ARGs will be uploaded to Zenodo. 
+* `make_figure_data.py validation_aDNA 20`: The 20 argument specifies the chromosome, which defaults to chr20. Requires the Makefile in `data/adna` to be run, and the inferred 1KGP ARGs for chr20 (see above).
 * `make_figure_data.py validation_OOA`: Requires the data generated by `validation_real_tsdate.py` above
-* `make_figure_data.py validation_inversion`: Requires inferred 1KGP ARGs to be run. The inferred ARGs will be uploaded to Zenodo.
+* `make_figure_data.py validation_inversion`: Requires the inferred 1KGP ARGs (see above).
 
-Additional commands for generating 1KGP-related data require various data (inferred ARGs and related files) that will be uploaded to Zenodo:
+Additional commands for generating 1KGP-related data require the inferred 1KGP ARGs (see above) and, for `tgp_singleton` and `tgp_subset`, additional inferences on subsets of samples (`data/tgp/subsets/`) that are not included in the Zenodo record:
 
 * `make_figure_data.py tgp_singleton`
 * `make_figure_data.py tgp_subset`
@@ -59,21 +72,22 @@ Additional commands for generating 1KGP-related data require various data (infer
 The corresponding plots are produced by `plot.py` using the `.csv.zst` files:
 
 * `plot.py pedigree_sim`: Plots an evaluation of tsinfer+tsdate using a large pedigree dataset (Figure 2)
-* `plot.py sampling_sim`: Test robustness of allele ages/frequencies to unbalanced sampling (Figure S11)
-* `plot.py validation_aDNA`: Allele ages from tsinfer+tsdate are plotted against lower bound age estimates from the Allen Ancient DNA Resource (Figure S5)
-* `plot.py validation_OOA`: Compares PHLASH and tsinfer+tsdate estimates for the Out-of-Africa bottleneck time period (Figure S6)
-* `plot.py validation_inversion`: Compares age estimates for a chromosome 17 inversion from Relate and tsinfer+tsdate (Figure S7)
-* `plot.py tgp_subset`: Assesses the dependence on smple size of tsinfer+tsdate age estimates on the 1KGP dataset (Figure S8)
-* `plot.py tgp_singleton`: Evaluates phase-agnostic singleton age estimates on the 1KGP dataset (Figure S9).
+* `plot.py sampling_sim`: Test robustness of allele ages/frequencies to unbalanced sampling (ED Fig. 6)
+* `plot.py validation_aDNA`: Allele ages from tsinfer+tsdate are plotted against lower bound age estimates from the Allen Ancient DNA Resource (Fig. S4)
+* `plot.py validation_OOA`: Compares PHLASH and tsinfer+tsdate estimates for the Out-of-Africa bottleneck time period (Fig. S5)
+* `plot.py validation_inversion`: Compares age estimates for a chromosome 17 inversion from Relate and tsinfer+tsdate (Fig. S6)
+* `plot.py tgp_subset`: Assesses the dependence on sample size of tsinfer+tsdate age estimates on the 1KGP dataset (Fig. S7)
+* `plot.py tgp_singleton`: Evaluates phase-agnostic singleton age estimates on the 1KGP dataset (Fig. S8).
 
 # Standalone scripts
 
 These can be run without any arguments.
 
-* `algorithmic_schematic.py`: Makes the schematic diagram in Figure 1.
-* `sequence_length_accuracy_benchmark.py` Tests the bias in `tsdate` age estimates due to short sequence length (Figure S12)
-* `algorithmic_schematic_supp.py`: Produces the additional schematic in Figure S26.
-* `polytomy_bias_correction.py`: Tests the effect of polytomies on `tsdate` allele age estimates (Figure S27)
-* `phasing_benchmark.py`: Evaluates phase-agnostic dating performance (Figure S28).
+* `algorithm_schematic.py`: Makes the schematic diagram in Figure 1.
+* `phasing_benchmark_singletons.py`: Point-estimate accuracy, posterior interval coverage, and interval width of singleton age estimates under different phasing treatments (known, random, shortest-span, phase-agnostic); also produces a gamma-vs-exact posterior density illustration (ED Fig. 5).
+* `polytomy_bias_correction.py`: Tests the effect of polytomies on `tsdate` allele age estimates (Fig. S2)
+* `phasing_benchmark_doubleton.py`: Accuracy and coverage of doubleton ages across the same treatments (indirect effect of singleton phasing on deeper nodes) (Fig. S3).
+* `sequence_length_accuracy_benchmark.py` Tests the bias in `tsdate` age estimates due to short sequence length (Fig. S10)
+* `algorithm_schematic_supp.py`: Produces the additional schematic in Fig. S24.
 * `simulation_selection_analysis.r` Summarises results of various linear models comparing mutation age vs allele frequency (Table S8). Requires R to be installed.
-* `contig_table.py`: Prints the summary of GEL (Table S2) and 1KGP (Table S7) inference statistics.
+* `contig_table.py`: Prints the summary tables of GEL inference regions (Table S2), timing (Table S3) and statistics (Table S4), and of 1KGP inference statistics (Table S7).

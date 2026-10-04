@@ -1,0 +1,1264 @@
+import os
+import numpy as np
+
+configfile: "test-config.yaml"
+
+RNG = np.random.default_rng(config["random-seed"])
+OUTPUT_PREFIX = config["output-prefix"]
+TREES_DIR = config["trees-dir"]
+THREADS_PER_JOB = config["threads-per-job"]
+EP_ITERATIONS = config["ep-iterations"]
+RESCALING_ITERATIONS = config["rescaling-iterations"]
+RESCALING_INTERVALS = config["rescaling-intervals"]
+MIN_BRANCH_LENGTH = config["min-branch-length"]
+CONTIG = config["contig"]
+
+BASE_MODEL = config["base-model"]                 # AmericanAdmixture_4B18 (catalog)
+DFE_ID = config["dfe"]
+MUTATION_RATE = config["mutation-rate"]
+EXON_ONLY = config.get("exon-only", False)        # restrict DFE to exon annotation
+EXON_ANNOTATION = config.get("exon-annotation", "ensembl_havana_104_exons")
+SLIM_SCALING = config["slim-scaling"]
+SLIM_BURN_IN = config["slim-burn-in"]
+SLIM_PATH = config["slim-path"]
+
+# --- populations / cohort design -------------------------------------------
+REFERENCE_POP = config["reference-pop"]           # EUR: frequency baseline + control
+ANCESTRY_PANELS = config["ancestry-panels"]       # [AFR, EUR, ASIA] -> q columns (order matters)
+N_REFERENCE = config["n-reference"]               # EUR reference-cohort diploids (DAC baseline)
+N_CONTROL = config["n-control"]                   # pure-EUR control targets (non-EUR = 0)
+N_ADMIX_POOL = config["n-admix-pool"]             # oversampled ADMIX pool to subsample from
+N_PANEL = config["n-panel"]                       # AFR/ASIA calibration panel diploids (each)
+N_EUR_CALIB = config["n-eur-calib"]               # EUR diploids used for ancestry-freq calibration
+
+GRID_ADMIX = config["grid-admix"]                 # non-EUR ancestry grid points sourced from ADMIX
+N_PER_GROUP = config["n-per-group"]               # target diploids per group
+N_CANDIDATES = config["n-candidates"]             # closest-N ADMIX per grid point considered before thinning
+GRID_WINDOW = config["grid-window"]               # max |non-EUR - target| to qualify as a candidate
+SOURCE_PURE_COUNTS = config["source-pure-counts"] # {AFR: n, ASIA: n} for the non-EUR = 1.0 group
+N_SITES_ANCESTRY = config["n-sites-ancestry"]     # sites subsampled for the supervised ancestry fit
+IBD_MAX_TIME = config["ibd-max-time"]             # MRCA cutoff (gen) for recent-IBD relatedness
+IBD_MIN_SPAN = config["ibd-min-span"]             # min IBD segment span (bp)
+
+REPLICATES = config["replicates"]
+REPS = [f"rep{i}" for i in range(REPLICATES)]
+SEEDS = {r: RNG.integers(2 ** 32 - 1).item() for r in REPS}
+
+MAX_FREQ = config["max-freq"]                     # frequency-filter threshold (summary plot)
+AGE_FILTER = config["age-filter"]                 # age-filter threshold, generations
+DEL_THRESHOLD = config["del-threshold"]           # |s| above this counts as deleterious
+
+# group labels: control (non-EUR=0), ADMIX grid points, source-pure (non-EUR=1.0)
+def grid_label(v):
+    return "control" if v == 0.0 else f"g{int(round(v * 100)):03d}"
+
+GRID_VALUES = [0.0] + list(GRID_ADMIX) + [1.0]
+GROUPS = [grid_label(v) for v in GRID_VALUES]
+
+# --- AUC composite figure ---------------------------------------------------
+# Posterior-coverage / discrimination summary: within each cohort allele-count
+# (AC) stratum and admixture group, how well does mutation age separate
+# deleterious (|s| > s_min) from background (|s| <= s_min) variants. AUC(s_min)
+# = P(deleterious younger than background) = normalised Mann-Whitney U, with the
+# age integrated over its branch (Uniform between child/parent node times).
+AUC_S_GRID = np.logspace(-3.5, -1.0, 16)                 # deleteriousness thresholds swept (C/D x-axis)
+AUC_DAC_COLS = [("1", 1, 1), ("2", 2, 2), ("3", 3, 3)]   # frequency strata shown as columns
+AUC_AGE_DRAWS = 200                                      # branch-integration draws per mutation (proto stays at 10)
+AUC_MIN_MUT = 10                                         # min mutations per class to report a point
+AUC_HIST_GROUP = "g020"                                  # admixture group for the illustration histogram (B)
+AUC_HIST_DAC = 1                                         # allele count for panel B
+AUC_HIST_CUT = 0.05                                      # deleterious partition threshold for panel B
+AUC_ANC_SITES = 30000                                    # sites for the supervised ancestry simplex (A)
+AUC_ANC_EUR_PANEL = 2000                                 # EUR panel haplotypes for the simplex unmixing
+
+# --- EUR coverage / bias composite figure -----------------------------------
+# Singleton (AC=1) age accuracy in the EUR reference cohort, isolating dating from
+# inference: tsdate is run on BOTH the true topology (sim) and the tsinfer topology
+# (inf). Group A = mean log10 age bias vs |s|; B = posterior interval coverage;
+# C = inferred-vs-true age hexbins across |s| bins. Credible intervals are computed
+# by Monte Carlo over the gamma node posteriors (uncertainty-benchmark method).
+COV_WIDTHS = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99])  # nominal CI widths (B)
+COV_NMC = 2000                                           # Monte-Carlo draws per mutation for the CIs
+COV_SGRID = np.logspace(-6, 0, 25)                       # |s| bin edges for the bias curve (A)
+COV_MINN = 500                                           # min mutations per |s| bin to plot a point
+COV_EDGES_C = [0, 1e-4, 1e-3, 1e-2, 1e-1, np.inf]        # |s| bins for the hexbin row (C)
+
+# --- EUR CDF-difference figure ----------------------------------------------
+# At single EUR-DAC values (condition on one exact frequency to remove the age-
+# frequency confound), branch-integrated CDF of mutation age for deleterious
+# (|s|>s_cut) minus background (|s|<=s_cut), vs age t. Rows = True / Inferred ARG;
+# columns = the single DACs. The per-mutation clip term is the analytic
+# Uniform(t_child, t_parent) CDF -- the same branch-integration model as the AUROC
+# fig, computed exactly rather than by Monte Carlo.
+CDFDIFF_DACS = [1, 4, 10, 25]                            # single EUR-DAC columns
+CDFDIFF_SCUTS = [1e-3, 3e-3, 1e-2, 3e-2, 1e-1]           # deleterious cutoffs (one curve each)
+CDFDIFF_TGRID = np.logspace(0, 5, 160)                   # age grid (generations)
+CDFDIFF_MINMUT = 10                                      # min mutations per class to draw a curve
+CDFDIFF_NCAP = 50000                                     # max mutations per CDF (subsample for speed)
+
+# --- EUR AUROC-vs-DAC figure ------------------------------------------------
+# P(deleterious younger than background) = AUROC at single EUR-DAC values, vs DAC,
+# for several deleterious/background splits (|s|>0 vs neutral, then |s|>1e-3 .. 1e-1);
+# True ARG vs inferred ARG side by side, points + linear fits. Reuses eur_cdfdiff_data.
+AUROC_DACS = np.arange(1, 31)                            # single EUR-DAC values (x-axis)
+AUROC_SPLITS = [0.0, 1e-3, 1e-2, 10 ** -1.5, 1e-1]       # |s| split thresholds (0 => |s|>0 vs neutral s=0)
+AUROC_R = 200                                            # branch-integration draws per mutation
+AUROC_MINMUT = 10                                        # min mutations per class to plot a point
+AUROC_NCAP = 50000                                       # cell cap for the AUROC draws
+# illustrative top-row panels on the TRUE ARG (A: joint age-|s| cloud at one DAC; B: AUROC(s_min) curve)
+AUROC_DACSEL = 2                                         # the highlighted single DAC for panels A/B
+AUROC_SMIN_LINE = 0.1                                    # discrimination line drawn in A / marked in B
+AUROC_FLOOR_S = 1e-5                                     # |s| floor so neutral shows as a bottom band (log axis)
+AUROC_SGRID = np.logspace(-4, -0.7, 30)                  # s_min sweep for the B curve
+AUROC_OTHER_DACS = [1, 3, 4, 5]                          # gray context curves in B (AC 1-5 except DACSEL)
+AUROC_XMAX = 10 ** -0.15                                 # B x-axis extends past the last curve point -> room for AC labels
+
+
+# ---------------------------------------------------------------------------
+# Cohort selection helpers (run in the `select` rule on the true ARG, before
+# tsinfer). Ancestry from a supervised genotype proxy; each ADMIX grid point is
+# filled with the least-related individuals near the target ancestry, via
+# recent-IBD relative ranking (structure-free; reads the true ARG).
+# ---------------------------------------------------------------------------
+def _individuals(ts, nodes):
+    """Map sample nodes -> {individual_id: (node0, node1)} (diploid)."""
+    by_ind = {}
+    for n in nodes:
+        ind = ts.nodes_individual[n]
+        by_ind.setdefault(int(ind), []).append(int(n))
+    return {i: tuple(sorted(ns)) for i, ns in by_ind.items() if len(ns) == 2}
+
+
+def estimate_ancestry(ts, admix_nodes, calib_nodes, rng):
+    """Supervised global ancestry per ADMIX individual: solve the simplex-
+    constrained least squares q over panel derived-allele freqs (genotype-based,
+    so simplification-/inference-invariant). calib_nodes: {panel: node array} in
+    ANCESTRY_PANELS order. Returns (admix_ind_ids, Q[n,3])."""
+    from scipy.optimize import nnls
+    keepset = np.unique(np.concatenate([admix_nodes] + [calib_nodes[p] for p in ANCESTRY_PANELS]))
+    tsa = ts.simplify(samples=keepset, filter_sites=False, filter_populations=False)
+    full2col = {int(n): k for k, n in enumerate(keepset)}       # tsa col order == keepset order
+    G = tsa.genotype_matrix()
+    G = G[G.max(axis=1) <= 1]                                   # biallelic only
+
+    P_full = np.column_stack([
+        G[:, [full2col[int(n)] for n in calib_nodes[p]]].mean(axis=1) for p in ANCESTRY_PANELS])
+    informative = (P_full > 0).any(1) & (P_full < 1).any(1)
+    take = rng.choice(np.where(informative)[0],
+                      size=min(N_SITES_ANCESTRY, int(informative.sum())), replace=False)
+    P = P_full[take]
+
+    admix_inds = _individuals(ts, admix_nodes)
+    ids = sorted(admix_inds)
+    Q = np.empty((len(ids), 3))
+    for j, i in enumerate(ids):
+        c = [full2col[n] for n in admix_inds[i]]
+        dose = G[np.ix_(take, c)].sum(axis=1) / 2.0
+        q, _ = nnls(P, dose)
+        s = q.sum()
+        Q[j] = q / s if s > 0 else np.nan
+    return ids, Q, admix_inds
+
+
+def recent_ibd(ts, cand_nodes, node_to_ind):
+    """Total recent (MRCA <= IBD_MAX_TIME gen) IBD span per individual pair, in bp.
+    Structure-free relatedness from the true ARG; uses only MRCA-time + span (both
+    preserved by simplification), never tract fine-structure. max_time < admixture
+    (12 gen) so this captures pedigree kin, not the shared admixture ancestry."""
+    from collections import defaultdict
+    ibd = ts.ibd_segments(within=list(cand_nodes), max_time=IBD_MAX_TIME,
+                          min_span=IBD_MIN_SPAN, store_pairs=True, store_segments=True)
+    pair = defaultdict(float)
+    for (a, b), seglist in ibd.items():
+        ia, ib = node_to_ind[int(a)], node_to_ind[int(b)]
+        if ia != ib:
+            pair[(min(ia, ib), max(ia, ib))] += sum(s.right - s.left for s in seglist)
+    return pair
+
+
+def select_least_related(candidates, pair_ibd, n_keep):
+    """Relative ranking: greedily drop the individual with the most summed recent-IBD
+    to the rest until n_keep remain. Robust to estimator bias -- only needs the
+    relatedness ordering, not an absolute threshold."""
+    keep = list(candidates)
+    while len(keep) > n_keep:
+        ks = set(keep)
+        score = {i: 0.0 for i in keep}
+        for (a, b), span in pair_ibd.items():
+            if a in ks and b in ks:
+                score[a] += span
+                score[b] += span
+        keep.remove(max(score, key=score.get))
+    return keep
+
+
+def select_cohort(truth, rng, log):
+    """Build the analysis cohort from the full true ARG. Returns node sets in
+    FULL-truth coordinates: EUR reference (DAC baseline), per-group target nodes,
+    the union to infer on, and per-target ancestry."""
+    pop = {p.metadata["name"]: p.id for p in truth.populations() if p.metadata}
+    eur = truth.samples(population=pop[REFERENCE_POP])
+    admix = truth.samples(population=pop["ADMIX"])
+
+    ref_nodes = eur[: 2 * N_REFERENCE]                      # DAC baseline
+    control_pool = eur[2 * N_REFERENCE:]                    # disjoint pure-EUR controls
+    calib = {p: truth.samples(population=pop[p]) for p in ANCESTRY_PANELS}
+    calib[REFERENCE_POP] = eur[: 2 * N_EUR_CALIB]           # EUR freq from a reference subset
+
+    ids, Q, admix_inds = estimate_ancestry(truth, admix, calib, rng)
+    eur_col = ANCESTRY_PANELS.index(REFERENCE_POP)
+    non_eur = 1.0 - Q[:, eur_col]
+    log.info(f"ancestry (ADMIX pool n={len(ids)}): "
+             + ", ".join(f"q_{p}={Q[:,k].mean():.3f}" for k, p in enumerate(ANCESTRY_PANELS))
+             + f"; non-EUR range [{np.nanmin(non_eur):.2f},{np.nanmax(non_eur):.2f}]")
+
+    node_to_ind = {n: i for i in ids for n in admix_inds[i]}
+    group_nodes = {}
+    group_value = {}
+
+    # control: pure EUR (non-EUR = 0)
+    ctrl = control_pool[: 2 * N_CONTROL]
+    group_nodes["control"] = np.asarray(ctrl)
+    group_value["control"] = 0.0
+
+    # ADMIX grid points: closest candidates within window, then least-related n
+    for v in GRID_ADMIX:
+        lab = grid_label(v)
+        d = np.abs(non_eur - v)
+        cand = [ids[j] for j in np.argsort(d) if d[j] <= GRID_WINDOW][:N_CANDIDATES]
+        cand_nodes = [n for i in cand for n in admix_inds[i]]
+        pair = recent_ibd(truth, cand_nodes, node_to_ind) if cand else {}
+        chosen = select_least_related(cand, pair, N_PER_GROUP)
+        group_nodes[lab] = np.array([n for i in chosen for n in admix_inds[i]], dtype=np.int64)
+        group_value[lab] = v
+        kept = set(chosen)
+        maxrel = max((s for (a, b), s in pair.items() if a in kept and b in kept), default=0.0)
+        log.info(f"group {lab} (non-EUR~{v}): {len(cand)} candidates -> kept {len(chosen)}; "
+                 f"max retained recent-IBD = {maxrel/1e6:.2f} Mb")
+
+    # source-pure: non-EUR = 1.0, AFR+ASIA in the admixture ratio (no thinning)
+    pure = []
+    for p, k in SOURCE_PURE_COUNTS.items():
+        pn = truth.samples(population=pop[p])
+        pure.extend(pn[: 2 * k])
+    group_nodes["g100"] = np.asarray(pure, dtype=np.int64)
+    group_value["g100"] = 1.0
+
+    # per-target ancestry (q) for record/plot
+    q_by_ind = {i: Q[j] for j, i in enumerate(ids)}
+    target_nodes = np.unique(np.concatenate([group_nodes[g] for g in GROUPS]))
+    infer_nodes = np.unique(np.concatenate([ref_nodes, target_nodes]))
+    return dict(reference_nodes=np.asarray(ref_nodes, dtype=np.int64),
+                group_nodes=group_nodes, group_value=group_value,
+                infer_nodes=infer_nodes.astype(np.int64),
+                admix_ancestry={int(i): q_by_ind[i].tolist() for i in ids})
+
+
+rule all:
+    input:
+        plot = f"{OUTPUT_PREFIX}.pdf",                       # AUC composite (admixture discrimination)
+        eur = f"{OUTPUT_PREFIX}.eur_composite.pdf",          # EUR singleton bias / coverage / hexbins
+        cdf = f"{OUTPUT_PREFIX}.eur_cdfdiff.pdf",            # EUR CDF-difference vs age, single-DAC columns
+        auroc = f"{OUTPUT_PREFIX}.eur_auroc.pdf",            # EUR AUROC vs DAC, true vs inferred
+
+
+rule simulate:
+    output:
+        trees = os.path.join(TREES_DIR, "{rep}.simulate.tsz"),
+    log:
+        os.path.join(TREES_DIR, "{rep}.simulate.log"),
+    params:
+        scaling = SLIM_SCALING,
+        burn_in = SLIM_BURN_IN,
+        exon_only = EXON_ONLY,
+        seed = lambda w: SEEDS[w.rep],
+    run:
+        import stdpopsim
+        import tszip
+        import logging
+        logging.basicConfig(filename=str(log), filemode="w", level=logging.INFO)
+
+        species = stdpopsim.get_species("HomSap")
+        model = species.get_demographic_model(BASE_MODEL)   # catalog AmericanAdmixture_4B18
+        contig = species.get_contig(**CONTIG, mutation_rate=MUTATION_RATE)
+        dfe = species.get_dfe(DFE_ID)
+        if params.exon_only:
+            annot = species.get_annotations(EXON_ANNOTATION)
+            intervals = annot.get_chromosome_annotations(CONTIG["chromosome"])
+            contig.add_dfe(intervals=intervals, DFE=dfe)
+        else:
+            contig.add_dfe(intervals=[[0, int(contig.length)]], DFE=dfe)
+
+        # generously sample all pops once -> a reusable "big" ARG we subsample later
+        samples = {
+            REFERENCE_POP: N_REFERENCE + N_CONTROL,
+            "ADMIX": N_ADMIX_POOL,
+        }
+        for p in ANCESTRY_PANELS:
+            if p != REFERENCE_POP:
+                samples[p] = N_PANEL
+
+        engine = stdpopsim.get_engine("slim")
+        ts = engine.simulate(
+            model, contig, samples,
+            slim_scaling_factor=params.scaling,
+            slim_burn_in=params.burn_in,
+            slim_path=SLIM_PATH,
+            logfile=os.path.join(TREES_DIR, f"{wildcards.rep}.slim.progress.log"),
+            logfile_interval=100,
+            seed=params.seed,
+        )
+        tszip.compress(ts, output.trees)
+
+
+rule select:
+    input:
+        truth = rules.simulate.output.trees,
+    output:
+        cohort = os.path.join(TREES_DIR, "{rep}.cohort.tsz"),
+        meta = os.path.join(TREES_DIR, "{rep}.cohort.pkl"),
+    log:
+        os.path.join(TREES_DIR, "{rep}.select.log"),
+    run:
+        import pickle
+        import tszip
+        import logging
+        logging.basicConfig(filename=str(log), filemode="w", level=logging.INFO)
+        log = logging.getLogger("select")
+
+        truth = tszip.load(input.truth)
+        rng = np.random.default_rng(SEEDS[wildcards.rep])
+        sel = select_cohort(truth, rng, log)
+
+        # simplify the truth down to {EUR reference + 300 targets} for tsinfer
+        cohort = truth.simplify(samples=sel["infer_nodes"].tolist(),
+                                filter_populations=False)
+        tszip.compress(cohort, output.cohort)
+        pickle.dump(sel, open(output.meta, "wb"))
+        log.info(f"cohort for inference: {sel['infer_nodes'].size} nodes "
+                 f"({sel['infer_nodes'].size // 2} diploids)")
+
+
+rule infer:
+    input:
+        trees = rules.select.output.cohort,
+    output:
+        trees = os.path.join(TREES_DIR, "{rep}.infer.tsz"),
+    log:
+        os.path.join(TREES_DIR, "{rep}.infer.log"),
+    threads: THREADS_PER_JOB
+    run:
+        import tsinfer
+        import tszip
+        import tskit
+        import logging
+        logging.basicConfig(filename=str(log), filemode="w", level=logging.INFO)
+
+        # SLiM tree sequences carry struct-codec metadata schemas, but tsinfer only
+        # accepts the JSON codec. None of it is needed for inference (selection/origin
+        # come from the truth ts in the mutations rule), so strip schemas + metadata.
+        tables = tszip.load(input.trees).dump_tables()
+        null = tskit.MetadataSchema.null()
+        tables.metadata_schema = null
+        tables.metadata = b""
+        for tbl in (tables.populations, tables.individuals, tables.nodes,
+                    tables.sites, tables.mutations):
+            tbl.metadata_schema = null
+            tbl.packset_metadata([b""] * tbl.num_rows)
+
+        data = tsinfer.SampleData.from_tree_sequence(tables.tree_sequence())
+        ts = tsinfer.infer(data, num_threads=threads)
+        tszip.compress(ts.simplify(), output.trees)
+
+
+rule date:
+    input:
+        trees = rules.infer.output.trees,
+    output:
+        trees = os.path.join(TREES_DIR, "{rep}.date.tsz"),
+    log:
+        os.path.join(TREES_DIR, "{rep}.date.log"),
+    run:
+        import tsdate
+        import tszip
+        import logging
+        logging.basicConfig(filename=str(log), filemode="w", level=logging.INFO)
+        ts = tszip.load(input.trees)
+        dated = tsdate.date(
+            tsdate.preprocess_ts(ts),
+            mutation_rate=MUTATION_RATE,
+            max_iterations=EP_ITERATIONS,
+            rescaling_iterations=RESCALING_ITERATIONS,
+            rescaling_intervals=RESCALING_INTERVALS,
+            eps=MIN_BRANCH_LENGTH,
+            set_metadata=False,
+        )
+        tszip.compress(dated, output.trees)
+
+
+rule mutations:
+    input:
+        cohort = rules.select.output.cohort,   # the frozen ground-truth ARG (15k ref + 300 targets)
+        dated = rules.date.output.trees,
+        meta = rules.select.output.meta,
+    output:
+        data = os.path.join(TREES_DIR, "{rep}.mutations.pkl"),
+    run:
+        import pickle
+        import tskit
+        import tszip
+
+        # true ages are read from the SAME cohort the inferred ARG was built from,
+        # so true-vs-inferred midpoints are on one genealogy (same sample set).
+        truth = tszip.load(input.cohort)
+        dated = tszip.load(input.dated)
+        sel = pickle.load(open(input.meta, "rb"))
+
+        # map biallelic sites of the inferred (dated) ARG to a dense index
+        muts_per_site = np.bincount(dated.mutations_site, minlength=dated.num_sites)
+        biallelic = np.flatnonzero(muts_per_site == 1)
+        position_map = {dated.sites_position[s]: i for i, s in enumerate(biallelic)}
+        n = len(position_map)
+        positions = np.full(n, np.nan)
+        for pos, i in position_map.items():
+            positions[i] = pos
+
+        # --- inferred age: midpoint of the mutation's edge in the dated ARG ----
+        inferred_age = np.full(n, np.nan)
+        for t in dated.trees():
+            for m in t.mutations():
+                pos = dated.sites_position[m.site]
+                if m.edge != tskit.NULL and pos in position_map:
+                    p, c = dated.edges_parent[m.edge], dated.edges_child[m.edge]
+                    inferred_age[position_map[pos]] = (
+                        dated.nodes_time[p] + dated.nodes_time[c]) / 2
+
+        # --- truth: selection coefficient + mutation type per site -------------
+        site_sel = np.zeros(truth.num_sites)
+        site_mtype = np.full(truth.num_sites, -1, dtype=np.int64)
+        for site in truth.sites():
+            for mut in site.mutations:
+                md = mut.metadata
+                ml = md.get("mutation_list") if isinstance(md, dict) else None
+                if ml:
+                    site_sel[site.id] = ml[0].get("selection_coeff", 0.0)
+                    site_mtype[site.id] = ml[0].get("mutation_type", -1)
+                    break
+        site_sel /= SLIM_SCALING  # SLiM stores s * Q; recover the true coefficient
+
+        # --- cohort node sets, mapped to cohort-ARG coordinates ----------------
+        # select stored node ids in full-truth coords; the cohort ARG renumbered its
+        # samples to match infer_nodes order, so searchsorted maps full -> cohort.
+        inf = sel["infer_nodes"]
+        cohort_nodes = np.searchsorted(inf, sel["reference_nodes"])           # EUR reference, DAC baseline
+        group_nodes = {g: np.searchsorted(inf, v) for g, v in sel["group_nodes"].items()}
+
+        # --- one truth pass (reference-tracked): true ages, origin, ref count ---
+        true_age = np.full(n, np.nan)           # exact age-on-branch (mutations_time)
+        true_midpoint = np.full(n, np.nan)      # midpoint of the true edge (matches estimand)
+        origin = np.full(n, -1, dtype=np.int64)
+        reference_count = np.zeros(n, dtype=np.int64)
+        for t in truth.trees(tracked_samples=cohort_nodes):
+            for m in t.mutations():
+                pos = truth.sites_position[m.site]
+                if pos in position_map:
+                    i = position_map[pos]
+                    true_age[i] = truth.mutations_time[m.id]
+                    if m.edge != tskit.NULL:
+                        true_midpoint[i] = (truth.nodes_time[truth.edges_parent[m.edge]]
+                                            + truth.nodes_time[truth.edges_child[m.edge]]) / 2
+                    origin[i] = truth.nodes_population[m.node]
+                    reference_count[i] = t.num_tracked_samples(m.node)
+
+        selection = np.full(n, 0.0)
+        mutation_type = np.full(n, -1, dtype=np.int64)
+        for pos, i in position_map.items():
+            sid = truth.sites_position.searchsorted(pos)
+            if sid < truth.num_sites and truth.sites_position[sid] == pos:
+                selection[i] = site_sel[sid]
+                mutation_type[i] = site_mtype[sid]
+
+        # forward-phase vs recapitation: drop the recap-overlay neutrals that sit
+        # entirely above the deepest selected mutation (compare neutral & deleterious
+        # over the same forward-simulated age range).
+        selected = np.abs(selection) > 0
+        boundary = float(np.nanmax(true_age[selected])) if selected.any() else np.inf
+        forward_phase = np.nan_to_num(true_age, nan=np.inf) <= boundary
+
+        # --- one truth pass per group: carrier membership of the targets ------
+        carriers = {}
+        for name, nodes in group_nodes.items():
+            carried = np.zeros(n, dtype=bool)
+            for t in truth.trees(tracked_samples=nodes):
+                for m in t.mutations():
+                    pos = truth.sites_position[m.site]
+                    if pos in position_map and t.num_tracked_samples(m.node) > 0:
+                        carried[position_map[pos]] = True
+            carriers[name] = carried
+
+        pickle.dump(
+            dict(
+                reference_haps=int(cohort_nodes.size),
+                position=positions,
+                true_age=true_age,
+                true_midpoint=true_midpoint,
+                inferred_age=inferred_age,
+                selection=selection,
+                mutation_type=mutation_type,
+                forward_phase=forward_phase,
+                recap_boundary=boundary,
+                origin=origin,
+                reference_count=reference_count,
+                carriers=carriers,
+                group_value=sel["group_value"],
+                admix_ancestry=sel["admix_ancestry"],
+            ),
+            open(output.data, "wb"),
+        )
+
+
+rule auc_data:
+    input:
+        cohort = rules.select.output.cohort,   # frozen ground-truth ARG (true ages, selection, origin)
+        dated = rules.date.output.trees,       # inferred + dated ARG (inferred ages)
+        meta = rules.select.output.meta,
+    output:
+        data = os.path.join(TREES_DIR, "{rep}.auc.pkl"),
+    run:
+        import pickle
+        import tskit
+        import tszip
+
+        truth = tszip.load(input.cohort)
+        sel = pickle.load(open(input.meta, "rb"))
+        inf = sel["infer_nodes"]
+
+        # target nodes (cohort coords) tagged by group index, for the per-site group bitmask
+        tnodes, gidx = [], []
+        for gi, g in enumerate(GROUPS):
+            for nd in np.searchsorted(inf, sel["group_nodes"][g]):
+                tnodes.append(int(nd)); gidx.append(gi)
+        tnodes = np.array(tnodes); gidx = np.array(gidx)
+
+        # --- truth pass: true child/parent node times, cohort allele count, origin, |s| ---
+        nt, ep, ec = truth.nodes_time, truth.edges_parent, truth.edges_child
+        S = truth.num_sites
+        site_sel = np.zeros(S)
+        tct = np.full(S, np.nan); tpt = np.full(S, np.nan)   # true child / parent node times
+        dac = np.zeros(S, np.int64)                          # derived-allele count in the cohort
+        orig = np.full(S, -1, np.int64)                      # SLiM subpopulation of origin
+        for t in truth.trees():
+            for m in t.mutations():
+                md = m.metadata
+                ml = md.get("mutation_list") if isinstance(md, dict) else None
+                if m.edge != tskit.NULL and np.isnan(tct[m.site]):
+                    tct[m.site] = nt[ec[m.edge]]; tpt[m.site] = nt[ep[m.edge]]
+                    dac[m.site] = t.num_samples(m.node)
+                    if ml: orig[m.site] = ml[0].get("subpopulation", -1)
+                if ml and site_sel[m.site] == 0:
+                    site_sel[m.site] = abs(ml[0].get("selection_coeff", 0.0))
+        site_sel /= SLIM_SCALING                             # SLiM stores s * Q
+
+        # biallelic + forward-phase (drop recap neutrals above the deepest selected mutation)
+        bi = np.bincount(truth.mutations_site, minlength=S) == 1
+        mid = (tct + tpt) / 2
+        boundary = np.nanmax(mid[(site_sel > 0) & bi])
+        forward = np.nan_to_num(mid, nan=np.inf) <= boundary
+
+        # --- inferred pass: dated child/parent node times, keyed by position ---
+        dated = tszip.load(input.dated)
+        dnt, dep, dec = dated.nodes_time, dated.edges_parent, dated.edges_child
+        cpos = {}
+        for tr in dated.trees():
+            for m in tr.mutations():
+                p = dated.sites_position[m.site]
+                if m.edge != tskit.NULL and p not in cpos:
+                    cpos[p] = (dnt[dec[m.edge]], dnt[dep[m.edge]])
+        iac = np.array([cpos.get(p, (np.nan, np.nan))[0] for p in truth.sites_position])
+        iap = np.array([cpos.get(p, (np.nan, np.nan))[1] for p in truth.sites_position])
+
+        # per-site group membership bitmask (which groups carry the derived allele)
+        mask = bi & forward & (dac >= 1) & (dac <= 10) & np.isfinite(tct) & (tpt > tct)
+        gmask = np.zeros(S, np.int16)
+        for var in truth.variants(samples=tnodes, isolated_as_missing=False):
+            s = var.site.id
+            if not mask[s]: continue
+            mm = 0
+            for gi in np.unique(gidx[var.genotypes > 0]): mm |= (1 << int(gi))
+            gmask[s] = mm
+
+        idx = np.where(mask & (gmask > 0))[0]
+        pickle.dump(
+            dict(DAC=dac[idx], SEL=site_sel[idx], GM=gmask[idx], ORIG=orig[idx],
+                 TAC=tct[idx], TAP=tpt[idx], IAC=iac[idx], IAP=iap[idx]),
+            open(output.data, "wb"),
+        )
+
+
+rule ancestry_simplex:
+    input:
+        cohort = os.path.join(TREES_DIR, f"{REPS[0]}.cohort.tsz"),
+    output:
+        data = f"{OUTPUT_PREFIX}.ancestry.pkl",
+    run:
+        import pickle
+        import tszip
+        from scipy.optimize import nnls
+
+        rng = np.random.default_rng(SEEDS[REPS[0]])
+        ts = tszip.load(input.cohort)
+        nodepop = ts.tables.nodes.population
+        nm = {p.id: (p.metadata or {}).get("name", str(p.id)) for p in ts.populations()}
+        samp = ts.samples()
+        pop_haps = {n: samp[nodepop[samp] == pid] for pid, n in nm.items()}
+
+        G = ts.genotype_matrix(); bi = G.max(1) <= 1
+        panel = {"AFR": pop_haps["AFR"], "EUR": pop_haps["EUR"][:AUC_ANC_EUR_PANEL], "ASIA": pop_haps["ASIA"]}
+        P_full = np.column_stack([G[:, panel[p]].mean(1) for p in ANCESTRY_PANELS])
+        ok = bi & (P_full > 0).any(1) & (P_full < 1).any(1)
+        take = rng.choice(np.where(ok)[0], min(AUC_ANC_SITES, int(ok.sum())), replace=False)
+        P = P_full[take]
+
+        Q = np.empty((ts.num_individuals, 3)); truepop = []
+        for j, ind in enumerate(ts.individuals()):
+            dose = G[np.ix_(take, ind.nodes)].sum(1) / 2.0
+            q, _ = nnls(P, dose); s = q.sum()
+            Q[j] = q / s if s > 0 else np.nan
+            truepop.append(nm[nodepop[ind.nodes[0]]])
+
+        eur_col = ANCESTRY_PANELS.index(REFERENCE_POP)
+        asia_col = ANCESTRY_PANELS.index("ASIA")
+        h = np.sqrt(3) / 2
+        nonEUR = 1 - Q[:, eur_col]
+        x = Q[:, asia_col] + 0.5 * Q[:, eur_col]; y = Q[:, eur_col] * h   # AFR=(0,0), ASIA=(1,0), EUR=apex
+        pickle.dump(dict(x=x, y=y, nonEUR=nonEUR, truepop=np.array(truepop)), open(output.data, "wb"))
+
+
+rule plot_auc:
+    input:
+        data = expand(rules.auc_data.output.data, rep=REPS),
+        ancestry = rules.ancestry_simplex.output.data,
+    output:
+        plot = f"{OUTPUT_PREFIX}.pdf",
+    run:
+        import pickle
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from scipy.stats import mannwhitneyu
+
+        # pool per-site arrays across replicates
+        keys = ["DAC", "SEL", "GM", "ORIG", "TAC", "TAP", "IAC", "IAP"]
+        raw = {k: [] for k in keys}
+        for path in input.data:
+            d = pickle.load(open(path, "rb"))
+            for k in keys: raw[k].append(d[k])
+        for k in keys: raw[k] = np.concatenate(raw[k])
+        ANC = pickle.load(open(input.ancestry, "rb"))
+
+        gv = {g: v for g, v in zip(GROUPS, GRID_VALUES)}
+        rng = np.random.default_rng(0)
+        cmap = plt.cm.turbo; h = np.sqrt(3) / 2
+        TS = AUC_S_GRID
+
+        def fast_auc(dd, sn):
+            if dd.size < 1 or sn.size < 1: return np.nan
+            return np.mean((sn.size - np.searchsorted(sn, dd, side="right")) / sn.size)
+
+        # AUC(s_min) curves: per tree type, per AC stratum, per admixture group
+        AUC = {}
+        for tree, ACa, APa in [("true", raw["TAC"], raw["TAP"]), ("inf", raw["IAC"], raw["IAP"])]:
+            AUC[tree] = {}
+            okm = np.isfinite(ACa) & (APa > ACa)
+            for lab, lo, hi in AUC_DAC_COLS:
+                AUC[tree][lab] = {}
+                for gi, g in enumerate(GROUPS):
+                    cell = np.where(okm & (raw["DAC"] >= lo) & (raw["DAC"] <= hi) & ((raw["GM"] & (1 << gi)) > 0))[0]
+                    if cell.size < AUC_MIN_MUT:
+                        AUC[tree][lab][g] = np.full(len(TS), np.nan); continue
+                    ad = rng.uniform(ACa[cell, None], APa[cell, None], size=(cell.size, AUC_AGE_DRAWS)).ravel()
+                    ab = np.repeat(raw["SEL"][cell], AUC_AGE_DRAWS); abss = raw["SEL"][cell]
+                    curve = []                                # partition: del=|s|>s_min vs background=|s|<=s_min
+                    for s in TS:
+                        nd = int((abss > s).sum()); nbg = int((abss <= s).sum())
+                        curve.append(fast_auc(ad[ab > s], np.sort(ad[ab <= s]))
+                                     if nd >= AUC_MIN_MUT and nbg >= AUC_MIN_MUT else np.nan)
+                    AUC[tree][lab][g] = np.array(curve)
+
+        # === assemble composite (2 rows x [left single panel | spacer | 3-panel block]) ===
+        fig = plt.figure(figsize=(9.4, 5.1), layout="constrained")
+        fig.get_layout_engine().set(w_pad=0.02, h_pad=0.02, wspace=0.0, hspace=0.06)
+        gs = fig.add_gridspec(2, 5, width_ratios=[1.3, 0.15, 1, 1, 1])   # col 1 = spacer
+
+        # (A) ancestry simplex + shared non-EUR colorbar
+        axa = fig.add_subplot(gs[0, 0])
+        axa.plot([0, 1, 0.5, 0], [0, 0, h, 0], "k-", lw=1.2, zorder=1, clip_on=False)
+        sc = axa.scatter(ANC["x"], ANC["y"], c=ANC["nonEUR"], cmap="turbo", s=4, edgecolors="none", zorder=3, clip_on=False, rasterized=True)
+        SAMP = {"AFR": SOURCE_PURE_COUNTS["AFR"], "ASIA": SOURCE_PURE_COUNTS["ASIA"], "EUR": N_REFERENCE + N_CONTROL}
+        n_admix = len(GRID_ADMIX) * N_PER_GROUP
+        for cx, cy, lab, va, ha, dy in [(0.04, 0, "AFR", "top", "center", -0.03), (0.96, 0, "ASIA", "top", "center", -0.03),
+                                        (0.5, h, "EUR", "bottom", "center", 0.03)]:
+            axa.text(cx, cy + dy, f"{lab}\n($n={SAMP[lab]}$)", ha=ha, va=va, ma="center", fontsize=7.5)
+        axa.text(0.12, 0.56 * h, f"ADMIX\n($n={n_admix}$)", ha="center", va="center", fontsize=7.5)
+        axa.set_xlim(-0.05, 1.05); axa.set_ylim(0.05, h + 0.10); axa.set_aspect("equal"); axa.axis("off")
+        cax = axa.inset_axes([0.72, 0.92, 0.3, 0.045], clip_on=False)
+        cb = fig.colorbar(sc, cax=cax, orientation="horizontal"); cb.set_ticks([0, 0.5, 1])
+        cb.set_label("non-EUR ancestry", fontsize=7); cb.ax.tick_params(labelsize=6)
+        axa.set_title("A.", loc="left", fontweight="bold", fontsize=12)
+
+        # (B) age-distribution illustration histogram (one representative cell)
+        axb = fig.add_subplot(gs[1, 0])
+        bit = 1 << GROUPS.index(AUC_HIST_GROUP)
+        cell = ((raw["DAC"] == AUC_HIST_DAC) & ((raw["GM"] & bit) > 0)
+                & np.isfinite(raw["TAC"]) & (raw["TAP"] > raw["TAC"]))
+        rng = np.random.default_rng(0)   # dedicated seed for panel B (order-independent of the curve draws)
+        def ages(m): return rng.uniform(raw["TAC"][m], raw["TAP"][m])   # branch-integrated age (matches C/D)
+        dele = ages(cell & (raw["SEL"] > AUC_HIST_CUT)); neut = ages(cell & (raw["SEL"] <= AUC_HIST_CUT))
+        auc = 1 - mannwhitneyu(dele, neut).statistic / (dele.size * neut.size)
+        ln, ld = np.log10(neut), np.log10(dele)
+        lo, hi = min(ln.min(), ld.min()), max(ln.max(), ld.max())
+        bins = np.linspace(lo, hi, 50)
+        axb.hist(ld, bins=bins, density=True, histtype="stepfilled", color="0.3", alpha=0.5)
+        axb.hist(ln, bins=bins, density=True, histtype="stepfilled", color="0.75", alpha=0.5)
+        tk = np.arange(-2, 6)
+        axb.set_xticks(tk); axb.set_xticklabels([f"$10^{{{int(t)}}}$" for t in tk]); axb.set_xlim(-2, 5)
+        axb.set_xlabel("Mutation age (generations)", fontsize=8.5); axb.set_ylabel("Density", fontsize=8.5)
+        axb.tick_params(labelsize=7.5); axb.tick_params(labelleft=False)
+        axb.spines[["top", "right"]].set_visible(False)
+        ctr = 0.5 * (bins[:-1] + bins[1:])
+        ylab = np.histogram(ln, bins=bins, density=True)[0].max()
+        for vals, col, txt, dx, ha in [(ld, "0.3", "deleterious\n" + r"($|s|>s_{\mathrm{min}}$)", -0.4, "right"),
+                                       (ln, "0.75", "background\n" + r"($|s|\leq s_{\mathrm{min}}$)", 0.4, "left")]:
+            hc, _ = np.histogram(vals, bins=bins, density=True)
+            axb.text(ctr[hc.argmax()] + dx, ylab, txt, color=col, ha=ha, va="center", fontsize=7.5)
+        axb.set_ylim(top=axb.get_ylim()[1] * 1.2)
+        axb.text(0.5, 0.97, r"$P(\mathrm{deleterious\ is\ younger}) = \mathrm{AUROC}(s_{\mathrm{min}})$",
+                 transform=axb.transAxes, ha="center", va="top", fontsize=7.5)
+        axb.set_title("B.", loc="left", fontweight="bold", fontsize=12)
+
+        # (C) True ARG and (D) Inferred ARG: AUC(s_min) per AC stratum, shared x/y per row
+        COLS = [lab for lab, _, _ in AUC_DAC_COLS]
+        for r, (tree, letter, treelab) in enumerate([("true", "C.", "True ARG"), ("inf", "D.", "Inferred ARG")]):
+            rbase = None; row_axes = []
+            for ci, col in enumerate(COLS):
+                ax = fig.add_subplot(gs[r, 2 + ci], sharex=rbase, sharey=rbase); rbase = rbase or ax; row_axes.append(ax)
+                for g in GROUPS:
+                    ax.plot(TS, AUC[tree][col][g], color=cmap(gv[g]), lw=1.3)
+                ax.axhline(0.5, color="0.5", ls=":", lw=0.8)
+                ax.set_xscale("log"); ax.set_ylim(0.45, 1.0)
+                ax.text(0.05, 0.95, f"{treelab}, AC = {col}", transform=ax.transAxes, ha="left", va="top", fontsize=7.5)
+                if ci != 0: ax.tick_params(labelleft=False)
+                ax.tick_params(labelsize=7.5)
+            row_axes[0].set_ylabel(r"$\mathrm{AUROC}(s_{\mathrm{min}})$", fontsize=8.5)
+            row_axes[0].set_title(letter, loc="left", fontweight="bold", fontsize=12)
+            span = fig.add_subplot(gs[r, 2:5]); span.set_xticks([]); span.set_yticks([]); span.set_frame_on(False)
+            span.set_xlabel(r"Deleteriousness threshold $s_{\mathrm{min}}$", labelpad=18, fontsize=8.5)
+
+        fig.savefig(output.plot, dpi=300)
+
+
+rule eur_coverage_data:
+    input:
+        cohort = rules.select.output.cohort,       # frozen true ARG (ages, selection)
+        meta = rules.select.output.meta,
+        infer = rules.infer.output.trees,          # tsinfer topology (undated)
+    output:
+        data = os.path.join(TREES_DIR, "{rep}.eur_coverage.pkl"),
+    run:
+        import pickle
+        import tskit
+        import tszip
+        import tsdate
+
+        widths = COV_WIDTHS
+        lq = (1 - widths) / 2; uq = 1 - lq
+
+        def true_site_arrays(ts):              # first-mutation per site: child/parent time, exact age, DAC, |s|
+            nt, ep, ec, mt = ts.nodes_time, ts.edges_parent, ts.edges_child, ts.mutations_time
+            S = ts.num_sites
+            sel = np.zeros(S); tc = np.full(S, np.nan); tp = np.full(S, np.nan)
+            tage = np.full(S, np.nan); dac = np.zeros(S, np.int64)
+            for t in ts.trees():
+                for m in t.mutations():
+                    if m.edge != tskit.NULL and np.isnan(tc[m.site]):
+                        tc[m.site] = nt[ec[m.edge]]; tp[m.site] = nt[ep[m.edge]]
+                        tage[m.site] = mt[m.id]; dac[m.site] = t.num_samples(m.node)
+                    md = m.metadata; ml = md.get("mutation_list") if isinstance(md, dict) else None
+                    if ml and sel[m.site] == 0: sel[m.site] = abs(ml[0].get("selection_coeff", 0.0))
+            sel /= SLIM_SCALING
+            return sel, tc, tp, tage, dac
+
+        def strip(ts):                         # drop SLiM struct metadata schemas (after |s|/ages are read)
+            tb = ts.dump_tables(); null = tskit.MetadataSchema.null()
+            tb.metadata_schema = null; tb.metadata = b""
+            for t in (tb.populations, tb.individuals, tb.nodes, tb.sites, tb.mutations):
+                t.metadata_schema = null; t.packset_metadata([b""] * t.num_rows)
+            return tb.tree_sequence()
+
+        def date_and_ci(ts_topo, preprocess, posmap, n, seed):
+            """tsdate a topology, then per-singleton credible intervals (Monte Carlo over gamma node
+            posteriors: age ~ Uniform(t_child, t_parent), conditioned on t_parent > t_child) + midpoint."""
+            ts2 = tsdate.preprocess_ts(ts_topo) if preprocess else ts_topo
+            dated, fit = tsdate.date(ts2, mutation_rate=MUTATION_RATE, max_iterations=EP_ITERATIONS,
+                                     rescaling_iterations=RESCALING_ITERATIONS, rescaling_intervals=RESCALING_INTERVALS,
+                                     eps=MIN_BRANCH_LENGTH, set_metadata=False, return_fit=True)
+            npost = fit.node_posteriors(); dnt = dated.nodes_time
+            dbi = np.bincount(dated.mutations_site, minlength=dated.num_sites) == 1
+            cm = np.full(n, np.nan); cv = np.full(n, np.nan)
+            pm = np.full(n, np.nan); pv = np.full(n, np.nan); imid = np.full(n, np.nan)
+            for t in dated.trees():
+                for mut in t.mutations():
+                    p = dated.sites_position[mut.site]
+                    if mut.edge == tskit.NULL or not dbi[mut.site] or p not in posmap:
+                        continue
+                    par = t.parent(mut.node)
+                    if par == tskit.NULL:
+                        continue
+                    i = posmap[p]
+                    cm[i] = npost["mean"][mut.node]; cv[i] = npost["variance"][mut.node]
+                    pm[i] = npost["mean"][par]; pv[i] = npost["variance"][par]
+                    imid[i] = 0.5 * (dnt[mut.node] + dnt[par])
+            lower = np.full((n, widths.size), np.nan); upper = np.full((n, widths.size), np.nan)
+            valid = np.flatnonzero(np.isfinite(cm) & np.isfinite(pm) & (pv > 0))
+            rng = np.random.default_rng(seed); CH = 20000
+            for s in range(0, valid.size, CH):
+                idx = valid[s:s + CH]; k = idx.size
+                cmv, cvv, pmv, pvv = cm[idx], cv[idx], pm[idx], pv[idx]
+                tc_ = np.zeros((k, COV_NMC)); free = cvv > 0   # child = leaf -> fixed at 0 for singletons
+                if free.any():
+                    sc, rc = cmv[free] ** 2 / cvv[free], cmv[free] / cvv[free]
+                    tc_[free] = rng.gamma(sc[:, None], 1 / rc[:, None], size=(int(free.sum()), COV_NMC))
+                sp, rp = pmv ** 2 / pvv, pmv / pvv
+                tp_ = rng.gamma(sp[:, None], 1 / rp[:, None], size=(k, COV_NMC))
+                v = tp_ > tc_
+                tm = np.where(v, tc_ + rng.random((k, COV_NMC)) * (tp_ - tc_), np.nan)
+                lower[idx] = np.nanquantile(tm, lq, axis=1).T
+                upper[idx] = np.nanquantile(tm, uq, axis=1).T
+            return lower, upper, imid
+
+        ri = REPS.index(wildcards.rep)
+        sel_meta = pickle.load(open(input.meta, "rb")); inf = sel_meta["infer_nodes"]
+        ref_cols = np.searchsorted(inf, sel_meta["reference_nodes"]).tolist()   # EUR reference (cohort coords)
+        eu = tszip.load(input.cohort).simplify(samples=ref_cols)
+        sel, tct, tpt, tage, dac = true_site_arrays(eu)
+        bi = np.bincount(eu.mutations_site, minlength=eu.num_sites) == 1
+        tmid = (tct + tpt) / 2
+        boundary = np.nanmax(tmid[(sel > 0) & bi]); forward = np.nan_to_num(tmid, nan=np.inf) <= boundary
+        sidx = np.flatnonzero(bi & forward & np.isfinite(tct) & (tpt > tct) & (dac == 1))   # EUR singletons
+        pos = eu.sites_position[sidx]; n = pos.size
+        posmap = {p: i for i, p in enumerate(pos)}
+
+        lo_s, up_s, imid_s = date_and_ci(strip(eu), False, posmap, n, 100 + ri)   # true topology + tsdate
+        topo = tszip.load(input.infer).simplify(samples=ref_cols)
+        lo_i, up_i, imid_i = date_and_ci(topo, True, posmap, n, 200 + ri)         # tsinfer topology + tsdate
+
+        pickle.dump(dict(SEL=sel[sidx], TAGE=tage[sidx], TMID=tmid[sidx],
+                         IMID_SIM=imid_s, IMID_INF=imid_i,
+                         LOWER_SIM=lo_s, UPPER_SIM=up_s, LOWER_INF=lo_i, UPPER_INF=up_i),
+                    open(output.data, "wb"))
+
+
+rule plot_eur_composite:
+    input:
+        data = expand(rules.eur_coverage_data.output.data, rep=REPS),
+    output:
+        plot = f"{OUTPUT_PREFIX}.eur_composite.pdf",
+    run:
+        # Manual axes placement: A/B = 4 panels + spacer, C = 5 hexbins; leftmost/rightmost spines aligned.
+        # (matplotlib's auto layout managers collapse on the mixed-column grid this needs.)
+        import pickle
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        keys = ["SEL", "TAGE", "TMID", "IMID_SIM", "IMID_INF", "LOWER_SIM", "UPPER_SIM", "LOWER_INF", "UPPER_INF"]
+        D = {k: [] for k in keys}
+        for path in input.data:
+            d = pickle.load(open(path, "rb"))
+            for k in keys: D[k].append(d[k])
+        for k in keys: D[k] = np.concatenate(D[k])
+        SEL, TAGE, TMID = D["SEL"], D["TAGE"], D["TMID"]
+        IMID_SIM, IMID_INF = D["IMID_SIM"], D["IMID_INF"]
+        LO_SIM, UP_SIM, LO_INF, UP_INF, WIDTHS = D["LOWER_SIM"], D["UPPER_SIM"], D["LOWER_INF"], D["UPPER_INF"], COV_WIDTHS
+        rng = np.random.default_rng(0)
+        TAGE = TAGE.copy(); TAGE[SEL > 0] += rng.uniform(0, 1, int((SEL > 0).sum()))   # de-discretize SLiM ages
+        CORR = 2.0 / np.e
+        EDGES = COV_SGRID; MINN = COV_MINN
+
+        fig = plt.figure(figsize=(9.2, 4.6))
+        L, R = 0.075, 0.015
+        W = 1 - L - R
+        SW = 0.09; IG = 0.025
+        PW = (W - 2 * IG - SW) / 4
+        GW = 0.012; HW = (W - 4 * GW) / 5
+        BAB, HAB = 0.60, 0.34
+        BC, HC = 0.11, 0.34
+        xA = [L, L + PW + IG]
+        xB = [L + 2 * PW + IG + SW, L + 3 * PW + 2 * IG + SW]
+        aA = [fig.add_axes([xA[0], BAB, PW, HAB]), fig.add_axes([xA[1], BAB, PW, HAB])]
+        aB = [fig.add_axes([xB[0], BAB, PW, HAB]), fig.add_axes([xB[1], BAB, PW, HAB])]
+        for pair in (aA, aB):
+            pair[1].sharex(pair[0]); pair[1].sharey(pair[0])
+
+        # --- Group A: bias vs |s| ---
+        for col, mid in enumerate([IMID_SIM, IMID_INF]):
+            a = aA[col]
+            for mname, ref, mult, color in [("vs true age", TAGE, CORR, "tab:green"),
+                                            ("vs true midpoint", TMID, 1.0, "tab:orange")]:
+                err = np.log10(mid * mult) - np.log10(ref)
+                x, y = [], []
+                for lo, hi in zip(EDGES[:-1], EDGES[1:]):
+                    m = (SEL >= lo) & (SEL < hi)
+                    if m.sum() < MINN: continue
+                    e = err[m]; e = e[np.isfinite(e)]
+                    x.append(np.sqrt(lo * hi)); y.append(e.mean())
+                a.plot(x, y, "-o", color=color, lw=1.3, ms=2.2, label=mname)
+            a.axhline(0.0, color="black", ls="--", lw=0.9); a.set_xscale("log")
+            a.tick_params(labelsize=7.5)
+            a.text(0.03, 0.97, "true+tsdate, singletons" if col == 0 else "tsinfer+tsdate, singletons",
+                   transform=a.transAxes, ha="left", va="top", fontsize=7)
+            if col == 0:
+                a.set_ylabel(r"Bias ($\log_{10}$ age)", fontsize=8.5)
+                a.legend(fontsize=7, frameon=False, loc="lower right")
+            else:
+                a.tick_params(labelleft=False)
+        aA[0].set_ylim(bottom=-0.06)
+
+        # --- Group B: coverage ---
+        for col, (lo, up) in enumerate([(LO_SIM, UP_SIM), (LO_INF, UP_INF)]):
+            a = aB[col]
+            for sname, sm, color in [(r"$|s|<10^{-5}$", SEL < 1e-5, "dodgerblue"),
+                                     (r"$|s|\geq10^{-1}$", SEL >= 1e-1, "firebrick")]:
+                t = TAGE[sm]; Lc = lo[sm]; Uc = up[sm]
+                obs = [(np.isfinite(Lc[:, j]) & (t > Lc[:, j]) & (t < Uc[:, j])).sum() / np.isfinite(Lc[:, j]).sum()
+                       for j in range(WIDTHS.size)]
+                a.plot(WIDTHS, obs, "-o", color=color, lw=1.3, ms=2.6, label=sname)
+            a.plot([0, 1], [0, 1], "k--", lw=0.9)
+            a.set_xlim(0, 1); a.set_ylim(0, 1); a.set_xticks([0, 0.3, 0.6, 0.9])
+            a.tick_params(labelsize=7.5)
+            a.text(0.03, 0.97, "true+tsdate, singletons" if col == 0 else "tsinfer+tsdate, singletons",
+                   transform=a.transAxes, ha="left", va="top", fontsize=7)
+            if col == 0:
+                a.set_ylabel("Posterior coverage", fontsize=8.5)
+                a.legend(fontsize=7, frameon=False, loc="lower right")
+            else:
+                a.tick_params(labelleft=False)
+
+        aA[0].set_title("A.", loc="left", fontweight="bold", fontsize=11)
+        aB[0].set_title("B.", loc="left", fontweight="bold", fontsize=11)
+        fig.text(L + PW + IG / 2, BAB - 0.06, r"Selection coefficient $|s|$", ha="center", va="top", fontsize=8.5)
+        fig.text(L + 3 * PW + 1.5 * IG + SW, BAB - 0.06, "Expected coverage (true mutation age)", ha="center", va="top", fontsize=8.5)
+
+        # --- Group C: hexbins of corrected inferred midpoint vs true mutation age, across |s| bins ---
+        EDGES_C = COV_EDGES_C
+        def _edge(v):
+            if v == 0: return "0"
+            if np.isinf(v): return r"\infty"
+            e = np.log10(v); return f"10^{{{e:.0f}}}" if abs(e - round(e)) < 1e-6 else f"10^{{{e:.1f}}}"
+        LAB_C = [rf"$|s| \in [{_edge(lo)}, {_edge(hi)})$" for lo, hi in zip(EDGES_C[:-1], EDGES_C[1:])]
+        EXT = (-0.5, 5); XTK = np.arange(0, 5); YTK = np.arange(0, 6)
+        ycorr = np.log10(IMID_INF * CORR)
+        axC = []
+        for i, (lo, hi) in enumerate(zip(EDGES_C[:-1], EDGES_C[1:])):
+            a = fig.add_axes([L + i * (HW + GW), BC, HW, HC], sharex=axC[0] if axC else None, sharey=axC[0] if axC else None)
+            axC.append(a)
+            mm = (SEL >= lo) & (SEL < hi)
+            lx = np.log10(TAGE[mm]); lyv = ycorr[mm]; gg = np.isfinite(lx) & np.isfinite(lyv)
+            a.hexbin(lx[gg], lyv[gg], gridsize=24, extent=(*EXT, *EXT), bins="log", cmap="viridis", mincnt=1)
+            a.plot(EXT, EXT, "r--", lw=0.8)
+            a.set_xlim(EXT); a.set_ylim(EXT)
+            a.set_xticks(XTK); a.set_xticklabels([f"$10^{{{t}}}$" for t in XTK])
+            a.text(0.05, 0.95, LAB_C[i], transform=a.transAxes, ha="left", va="top", fontsize=7)
+            a.tick_params(labelsize=7)
+            if i == 0:
+                a.set_yticks(YTK); a.set_yticklabels([f"$10^{{{t}}}$" for t in YTK])
+                a.set_ylabel("Inferred age (midpoint)", fontsize=8.5)
+            else:
+                a.tick_params(labelleft=False)
+        axC[0].set_title("C.", loc="left", fontweight="bold", fontsize=11)
+        fig.text(L + W / 2, BC - 0.06, "True singleton age", ha="center", va="top", fontsize=8.5)
+
+        fig.savefig(output.plot, dpi=300)
+
+
+rule eur_cdfdiff_data:
+    input:
+        cohort = rules.select.output.cohort,       # true ARG (ages, selection)
+        meta = rules.select.output.meta,
+        dated = rules.date.output.trees,           # full-cohort dated ARG (inferred ages)
+    output:
+        data = os.path.join(TREES_DIR, "{rep}.eur_cdfdiff.pkl"),
+    run:
+        import pickle
+        import tskit
+        import tszip
+
+        def site_arrays(ts):                       # first-mutation per site: child/parent time, EUR-DAC, |s|
+            nt, ep, ec = ts.nodes_time, ts.edges_parent, ts.edges_child
+            S = ts.num_sites
+            sel = np.zeros(S); tc = np.full(S, np.nan); tp = np.full(S, np.nan); dac = np.zeros(S, np.int64)
+            for t in ts.trees():
+                for m in t.mutations():
+                    if m.edge != tskit.NULL and np.isnan(tc[m.site]):
+                        tc[m.site] = nt[ec[m.edge]]; tp[m.site] = nt[ep[m.edge]]; dac[m.site] = t.num_samples(m.node)
+                    md = m.metadata; ml = md.get("mutation_list") if isinstance(md, dict) else None
+                    if ml and sel[m.site] == 0: sel[m.site] = abs(ml[0].get("selection_coeff", 0.0))
+            sel /= SLIM_SCALING
+            return sel, tc, tp, dac
+
+        sel_meta = pickle.load(open(input.meta, "rb")); inf = sel_meta["infer_nodes"]
+        ref_cols = np.searchsorted(inf, sel_meta["reference_nodes"]).tolist()   # EUR reference (cohort coords)
+        eu = tszip.load(input.cohort).simplify(samples=ref_cols)
+        sel, tct, tpt, dac = site_arrays(eu)
+        bi = np.bincount(eu.mutations_site, minlength=eu.num_sites) == 1
+        mid = (tct + tpt) / 2
+        boundary = np.nanmax(mid[(sel > 0) & bi]); forward = np.nan_to_num(mid, nan=np.inf) <= boundary
+
+        eui = tszip.load(input.dated).simplify(samples=ref_cols)   # full-cohort dated ARG -> EUR
+        dnt, dep, dec = eui.nodes_time, eui.edges_parent, eui.edges_child
+        cpos = {}
+        for tr in eui.trees():
+            for m in tr.mutations():
+                p = eui.sites_position[m.site]
+                if m.edge != tskit.NULL and p not in cpos: cpos[p] = (dnt[dec[m.edge]], dnt[dep[m.edge]])
+        iac = np.array([cpos.get(p, (np.nan, np.nan))[0] for p in eu.sites_position])
+        iap = np.array([cpos.get(p, (np.nan, np.nan))[1] for p in eu.sites_position])
+
+        keep = bi & forward & np.isfinite(tct) & (tpt > tct) & (dac >= 1)
+        idx = np.where(keep)[0]
+        pickle.dump(dict(DAC=dac[idx], SEL=sel[idx], TAC=tct[idx], TAP=tpt[idx], IAC=iac[idx], IAP=iap[idx]),
+                    open(output.data, "wb"))
+
+
+rule plot_eur_cdfdiff:
+    input:
+        data = expand(rules.eur_cdfdiff_data.output.data, rep=REPS),
+    output:
+        plot = f"{OUTPUT_PREFIX}.eur_cdfdiff.pdf",
+    run:
+        import pickle
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+
+        keys = ["DAC", "SEL", "TAC", "TAP", "IAC", "IAP"]
+        D = {k: [] for k in keys}
+        for path in input.data:
+            d = pickle.load(open(path, "rb"))
+            for k in keys: D[k].append(d[k])
+        for k in keys: D[k] = np.concatenate(D[k])
+        DAC, SEL, TAC, TAP, IAC, IAP = (D[k] for k in keys)
+        SCUTS, TGRID, MINMUT, NCAP = CDFDIFF_SCUTS, CDFDIFF_TGRID, CDFDIFF_MINMUT, CDFDIFF_NCAP
+        BINS = [(k, k) for k in CDFDIFF_DACS]; BLAB = [str(k) for k in CDFDIFF_DACS]
+        rng = np.random.default_rng(0)
+
+        def cdf(ac, ap, mask):
+            i = np.where(mask)[0]
+            if i.size > NCAP: i = rng.choice(i, NCAP, replace=False)
+            tc, tp = ac[i], ap[i]
+            return np.clip((TGRID[:, None] - tc[None, :]) / (tp - tc)[None, :], 0, 1).mean(1)   # analytic uniform-branch CDF
+
+        cmap = plt.cm.plasma
+        cols = [cmap(x) for x in np.linspace(0.05, 0.9, len(SCUTS))]
+        ROWS = [("True ARG", TAC, TAP), ("Inferred ARG", IAC, IAP)]
+        fig = plt.figure(figsize=(8, 4), layout="constrained")
+        gs = fig.add_gridspec(2, 4)
+        rbase = None
+        for r, (treelab, AcA, ApA) in enumerate(ROWS):
+            rowok = np.isfinite(AcA) & (ApA > AcA)
+            for ci, ((lo, hi), lab) in enumerate(zip(BINS, BLAB)):
+                ax = fig.add_subplot(gs[r, ci], sharex=rbase, sharey=rbase); rbase = rbase or ax
+                inbin = rowok & (DAC >= lo) & (DAC <= hi)
+                for sc, col in zip(SCUTS, cols):           # partition: del=|s|>s_cut vs background=|s|<=s_cut
+                    de = inbin & (SEL > sc); bg = inbin & (SEL <= sc)
+                    if de.sum() < MINMUT or bg.sum() < MINMUT: continue
+                    ax.plot(TGRID, cdf(AcA, ApA, de) - cdf(AcA, ApA, bg), "-", color=col, lw=1.6)
+                ax.axhline(0.0, color="k", ls=":", lw=1)
+                ax.set_xscale("log")
+                ax.text(0.04, 0.95, f"{treelab}, AC={lab}", transform=ax.transAxes, ha="left", va="top", fontsize=8)
+                if ci != 0: ax.tick_params(labelleft=False)
+                if r == 0: ax.tick_params(labelbottom=False)
+                ax.tick_params(labelsize=8)
+            if r == 1:
+                span = fig.add_subplot(gs[r, :]); span.set_xticks([]); span.set_yticks([]); span.set_frame_on(False)
+                span.set_xlabel(r"Generations ago ($t$)", labelpad=18, fontsize=9)
+
+        rbase.set_ylim(top=0.42)
+        fig.supylabel(r"$\mathrm{CDF}_{\mathrm{deleterious}}(t) - \mathrm{CDF}_{\mathrm{background}}(t)$", fontsize=9)
+        leg = fig.legend(handles=[Line2D([], [], color=c, lw=2, label=f"$|s|>{s:g}$") for s, c in zip(SCUTS, cols)],
+                         fontsize=8, ncol=len(SCUTS), loc="outside upper center", frameon=False,
+                         title="Deleterious/background split defined as:", columnspacing=1.4, handlelength=1.6)
+        leg.get_title().set_fontsize(8)
+        fig.savefig(output.plot, dpi=300)
+
+
+rule plot_eur_auroc:
+    input:
+        data = expand(rules.eur_cdfdiff_data.output.data, rep=REPS),   # reuses EUR per-site arrays
+    output:
+        plot = f"{OUTPUT_PREFIX}.eur_auroc.pdf",
+    run:
+        import pickle
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+
+        keys = ["DAC", "SEL", "TAC", "TAP", "IAC", "IAP"]
+        D = {k: [] for k in keys}
+        for path in input.data:
+            d = pickle.load(open(path, "rb"))
+            for k in keys: D[k].append(d[k])
+        for k in keys: D[k] = np.concatenate(D[k])
+        DAC, SEL, TAC, TAP, IAC, IAP = (D[k] for k in keys)
+
+        def fast_auc(dd, sn):
+            if dd.size < 1 or sn.size < 1: return np.nan
+            return np.mean((sn.size - np.searchsorted(sn, dd, side="right")) / sn.size)
+
+        # ---- (C) AUROC(s_min) vs DAC, true / inferred ARG ----
+        rngC = np.random.default_rng(0)
+
+        def auroc_for_tree(ac, ap):
+            okt = np.isfinite(ac) & (ap > ac)
+            res = {sm: ([], []) for sm in AUROC_SPLITS}
+            for k in AUROC_DACS:
+                idx = np.where(okt & (DAC == k))[0]
+                if idx.size == 0: continue
+                if idx.size > AUROC_NCAP: idx = rngC.choice(idx, AUROC_NCAP, replace=False)
+                sel = SEL[idx]
+                adraw = rngC.uniform(ac[idx][:, None], ap[idx][:, None], size=(idx.size, AUROC_R))
+                for sm in AUROC_SPLITS:
+                    dl = sel > sm; bl = (sel == 0) if sm == 0 else (sel <= sm)
+                    if dl.sum() < AUROC_MINMUT or bl.sum() < AUROC_MINMUT: continue
+                    de = adraw[dl].ravel(); bg = np.sort(adraw[bl].ravel())
+                    res[sm][0].append(int(k)); res[sm][1].append(fast_auc(de, bg))
+            return res
+
+        RES = {"True ARG": auroc_for_tree(TAC, TAP), "Inferred ARG": auroc_for_tree(IAC, IAP)}
+
+        # ---- (A,B) illustrative single-DAC panels on the TRUE ARG ----
+        rngAB = np.random.default_rng(0)
+
+        def auroc_curve(dac):                                  # AUROC(s_min) over AUROC_SGRID, one DAC
+            ii = np.where(np.isfinite(TAC) & (TAP > TAC) & (DAC == dac))[0]
+            s = SEL[ii]; ad = rngAB.uniform(TAC[ii][:, None], TAP[ii][:, None], size=(ii.size, AUROC_R))
+            return np.array([fast_auc(ad[s > sm].ravel(), np.sort(ad[s <= sm].ravel()))
+                             if (s > sm).sum() >= AUROC_MINMUT and (s <= sm).sum() >= AUROC_MINMUT else np.nan
+                             for sm in AUROC_SGRID])
+
+        ii = np.where(np.isfinite(TAC) & (TAP > TAC) & (DAC == AUROC_DACSEL))[0]
+        sel = SEL[ii]
+        age = rngAB.uniform(TAC[ii], TAP[ii])                  # one branch-integrated draw per mutation (cloud/marginal)
+        adraw = rngAB.uniform(TAC[ii][:, None], TAP[ii][:, None], size=(ii.size, AUROC_R))
+        auc = auroc_curve(AUROC_DACSEL)
+        _d0 = sel > AUROC_SMIN_LINE
+        auc_at_line = fast_auc(adraw[_d0].ravel(), np.sort(adraw[~_d0].ravel()))
+        auc_other = {dac: auroc_curve(dac) for dac in AUROC_OTHER_DACS}
+        sval = np.maximum(sel, AUROC_FLOOR_S)                  # |s| floored (neutral -> bottom band on log axis)
+        delet = sel > AUROC_SMIN_LINE; bgm = ~delet
+        COL_D, COL_B = "firebrick", "dodgerblue"
+
+        cmap = plt.cm.plasma
+        cols = [cmap(x) for x in np.linspace(0.05, 0.9, len(AUROC_SPLITS))]
+        def slabel(sm):
+            if sm == 0: return r"$|s| > 0$"
+            e = np.log10(sm); es = f"{e:.0f}" if abs(e - round(e)) < 1e-6 else f"{e:.1f}"
+            return rf"$|s| > 10^{{{es}}}$"
+        labels = [slabel(sm) for sm in AUROC_SPLITS]
+
+        # ---- combined figure: illustrative pair (A,B) above the production AUROC-vs-DAC pair (C) ----
+        # Manual fig.add_axes throughout (the constrained/compressed solver collapses on this mixed grid).
+        fig = plt.figure(figsize=(6.075, 5.6))
+        Lm, Rm = 0.10, 0.02
+        SW = 0.125                                             # top-row inter-panel spacer
+        COLW = (1 - Lm - Rm - SW) / 2
+        xA = Lm + COLW + SW
+        CSW = 0.02                                             # bottom-row inter-panel gap
+        CCOLW = (1 - Lm - Rm - CSW) / 2
+        xCR = Lm + CCOLW + CSW
+        BmC, HC = 0.105, 0.295                                 # C panels bottom / height (extra bottom room for x-label)
+        legY = 0.45                                            # C legend anchor (just above C panels)
+        HJ, HM, GAP = 0.244, 0.092, 0.025                      # top-row joint height (~80%); marginal height; gap
+        ytopT = 0.975                                          # top of the marginal panel (minimal top margin)
+        BmT = ytopT - HJ - GAP - HM
+        cx = (Lm + (1 - Rm)) / 2
+
+        # (A) joint (age, |s|) cloud + top marginal
+        axJ = fig.add_axes([Lm, BmT, COLW, HJ])
+        axM = fig.add_axes([Lm, BmT + HJ + GAP, COLW, HM], sharex=axJ)
+        axJ.scatter(age[bgm], sval[bgm], s=4, color=COL_B, alpha=0.25, edgecolors="none", rasterized=True)
+        axJ.scatter(age[delet], sval[delet], s=4, color=COL_D, alpha=0.25, edgecolors="none", rasterized=True)
+        axJ.set_xscale("log"); axJ.set_yscale("log")
+        axJ.axhline(AUROC_SMIN_LINE, color="k", ls="--", lw=1.2)
+        axJ.text(0.97, AUROC_SMIN_LINE, f" $s_{{\\min}}={AUROC_SMIN_LINE:g}$", transform=axJ.get_yaxis_transform(),
+                 ha="right", va="bottom", fontsize=7)
+        axJ.set_xlabel("Mutation age (generations)", fontsize=9)
+        axJ.set_ylabel(r"Deleteriousness ($|s|$)", fontsize=9)
+        axJ.set_ylim(AUROC_FLOOR_S * 0.6, 10 ** 0.5)
+        axJ.text(0.03, 0.97, f"AC = {AUROC_DACSEL}", transform=axJ.transAxes, ha="left", va="top", fontsize=9)
+        axJ.tick_params(labelsize=8)
+        logbins = np.logspace(np.log10(age.min()), np.log10(age.max()), 40)
+        wbg = np.ones(int(bgm.sum())) / int(bgm.sum())
+        wde = np.ones(int(delet.sum())) / int(delet.sum())
+        axM.hist(age[bgm], bins=logbins, weights=wbg, color=COL_B, alpha=0.55, label="background")
+        axM.hist(age[delet], bins=logbins, weights=wde, color=COL_D, alpha=0.55, label="deleterious")
+        axM.tick_params(labelbottom=False, labelleft=False, left=False); axM.set_yticks([])
+        axM.spines[["top", "right", "left"]].set_visible(False)
+        axM.margins(y=0)
+        axM.legend(fontsize=7, frameon=False, loc="upper right", handlelength=1.0)
+
+        # (B) AUROC vs s_min
+        axB = fig.add_axes([xA, BmT, COLW, HJ])
+        for dac in AUROC_OTHER_DACS:
+            axB.plot(AUROC_SGRID, auc_other[dac], "-", color="0.72", lw=1.1, zorder=1)
+            fin = np.where(np.isfinite(auc_other[dac]))[0]
+            if fin.size:
+                axB.text(AUROC_XMAX, auc_other[dac][fin[-1]], f"AC={dac}", ha="right", va="center",
+                         fontsize=7, color="0.62")
+        axB.plot(AUROC_SGRID, auc, "-", color="0.2", lw=1.6, zorder=3)
+        _fin = np.where(np.isfinite(auc))[0]
+        if _fin.size:
+            axB.text(AUROC_XMAX, auc[_fin[-1]], f"AC={AUROC_DACSEL}", ha="right", va="center",
+                     fontsize=7, color="0.2", fontweight="bold")
+        axB.axvline(AUROC_SMIN_LINE, color="k", ls="--", lw=1.2, zorder=2)
+        axB.scatter([AUROC_SMIN_LINE], [auc_at_line], color="k", s=20, zorder=5)
+        axB.axhline(0.5, color="0.6", ls=":", lw=0.8)
+        axB.set_xscale("log"); axB.set_ylim(0.45, 0.8); axB.set_xlim(AUROC_SGRID.min(), AUROC_XMAX)
+        axB.set_xlabel(r"Deleterious/background split ($s_{\min}$)", fontsize=9)
+        axB.set_ylabel(r"$\mathrm{AUROC}(s_{\min})$", fontsize=9)
+        axB.text(0.5, 1.04, r"$\mathrm{AUROC} \equiv P(\mathrm{deleterious~is~younger})$", transform=axB.transAxes,
+                 ha="center", va="bottom", fontsize=9, clip_on=False)
+        axB.tick_params(labelsize=8)
+        axB.spines[["top", "right"]].set_visible(False)
+
+        # (C) AUROC vs DAC, true / inferred
+        axCL = fig.add_axes([Lm, BmC, CCOLW, HC])
+        axCR = fig.add_axes([xCR, BmC, CCOLW, HC], sharex=axCL, sharey=axCL)
+        for ax, tree in [(axCL, "True ARG"), (axCR, "Inferred ARG")]:
+            res = RES[tree]
+            for sm, color in zip(AUROC_SPLITS, cols):
+                xs, ys = np.array(res[sm][0]), np.array(res[sm][1])
+                if xs.size == 0: continue
+                ax.scatter(xs, ys, color=color, s=3 ** 2, edgecolors="none", zorder=3)
+                if xs.size >= 2:
+                    coef = np.polyfit(xs, ys, 1); xl = np.array([xs.min(), xs.max()])
+                    ax.plot(xl, np.polyval(coef, xl), "-", color=color, lw=1.4, zorder=2)
+            ax.axhline(0.5, color="0.6", ls=":", lw=0.9); ax.set_ylim(0.45, 0.9)
+            ax.text(0.04, 0.96, tree, transform=ax.transAxes, ha="left", va="top", fontsize=9)
+            ax.tick_params(labelsize=8)
+        axCL.set_ylabel(r"$\mathrm{AUROC}(s_{\min})$", fontsize=9)
+        axCR.tick_params(labelleft=False)
+        fig.text(cx, 0.018, "Derived allele count in EUR (15k diploids)", ha="center", va="bottom", fontsize=9)
+        leg = fig.legend(handles=[Line2D([], [], color=c, marker="o", lw=1.4, ms=4, label=l) for c, l in zip(cols, labels)],
+                         ncol=len(AUROC_SPLITS), loc="center", bbox_to_anchor=(cx, legY), frameon=False,
+                         title="deleterious/background split defined as:", columnspacing=1.3, handlelength=1.6, fontsize=9)
+        leg.get_title().set_fontsize(9)
+
+        # panel labels
+        fig.text(0.01, ytopT, "A.", ha="left", va="top", fontweight="bold", fontsize=12)
+        fig.text(xA - (Lm - 0.01), ytopT, "B.", ha="left", va="top", fontweight="bold", fontsize=12)
+        fig.text(0.01, legY + 0.05, "C.", ha="left", va="top", fontweight="bold", fontsize=12)
+
+        fig.savefig(output.plot, dpi=300)

@@ -1239,3 +1239,366 @@ perm_test <- function(test_set, background_set, n_permutations = 10000) {
   
   return(p_value)
 }
+
+create_outlier_logistic_supp_table <- function(
+  test_results,
+  source_df,
+  csv_file,
+  outcome_col,
+  outcome_vec,
+  outlier_col,
+  outlier_thresh_vec,
+  group_col,
+  group_vals,
+  direction = "between",
+  outcome_label = "Class",
+  outlier_label = "Frequency-controlled age Z-score",
+  sig_digits = 3
+) {
+
+  library(dplyr)
+  library(tidyr)
+  library(knitr)
+
+  # --------------------------------------------------------------------------
+  # Reconstruct analysis dataset
+  # --------------------------------------------------------------------------
+
+  analysis_df <- source_df %>%
+    dplyr::filter(.data[[group_col]] %in% group_vals) %>%
+    dplyr::filter(
+      !is.na(.data[[outlier_col]]),
+      !is.na(.data[[outcome_col]])
+    )
+
+
+  # --------------------------------------------------------------------------
+  # Build tested Z-score bins
+  # --------------------------------------------------------------------------
+
+  if (direction == "between") {
+
+    bin_definitions <- tibble(
+      lower = head(outlier_thresh_vec, -1),
+      upper = tail(outlier_thresh_vec, -1)
+    ) %>%
+      dplyr::mutate(
+        raw_z_score_bin = paste(lower, upper, sep = " - "),
+        z_score_bin = dplyr::case_when(
+          is.infinite(lower) & lower < 0 ~ paste0("< ", upper),
+          is.infinite(upper) & upper > 0 ~ paste0("> ", lower),
+          TRUE ~ paste0(lower, " to ", upper)
+        )
+      )
+
+  } else {
+
+    bin_definitions <- tibble(
+      threshold = outlier_thresh_vec
+    ) %>%
+      dplyr::mutate(
+        z_score_bin = dplyr::case_when(
+          direction == "greater" ~ paste0("> ", threshold),
+          direction == "lesser"  ~ paste0("< ", threshold),
+          TRUE ~ as.character(threshold)
+        )
+      )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Count observations underlying each one-vs-rest logistic test
+  # --------------------------------------------------------------------------
+
+  count_list <- list()
+  counter <- 1
+
+  for (i in seq_len(nrow(bin_definitions))) {
+
+    if (direction == "between") {
+
+      lower <- bin_definitions$lower[i]
+      upper <- bin_definitions$upper[i]
+
+      in_z_score_bin <- (
+        analysis_df[[outlier_col]] > lower &
+          analysis_df[[outlier_col]] <= upper
+      )
+
+    } else if (direction == "greater") {
+
+      threshold <- bin_definitions$threshold[i]
+
+      in_z_score_bin <- analysis_df[[outlier_col]] > threshold
+
+    } else if (direction == "lesser") {
+
+      threshold <- bin_definitions$threshold[i]
+
+      in_z_score_bin <- analysis_df[[outlier_col]] < threshold
+    }
+
+    bin_label <- bin_definitions$z_score_bin[i]
+
+    for (class_value in outcome_vec) {
+
+      is_class <- analysis_df[[outcome_col]] == class_value
+
+      count_list[[counter]] <- tibble(
+        z_score_bin = bin_label,
+        class = class_value,
+
+        n_total = length(in_z_score_bin),
+
+        n_z_score_bin = sum(in_z_score_bin),
+        n_z_score_bin_class = sum(in_z_score_bin & is_class),
+        n_z_score_bin_other = sum(in_z_score_bin & !is_class),
+
+        n_outside_z_score_bin = sum(!in_z_score_bin),
+        n_outside_z_score_bin_class = sum(!in_z_score_bin & is_class),
+        n_outside_z_score_bin_other = sum(!in_z_score_bin & !is_class)
+      )
+
+      counter <- counter + 1
+    }
+  }
+
+  count_table <- dplyr::bind_rows(count_list)
+
+
+  # --------------------------------------------------------------------------
+  # Prepare regression results
+  # --------------------------------------------------------------------------
+
+  model_table <- test_results %>%
+    dplyr::mutate(
+      class = as.character(outcome),
+      z_score_bin = as.character(outlier_score),
+
+      beta = estimate,
+      odds_ratio = exp(estimate),
+      or_conf_low = exp(conf.low),
+      or_conf_high = exp(conf.high)
+    ) %>%
+    dplyr::select(
+      z_score_bin,
+      class,
+      beta,
+      std.error,
+      statistic,
+      odds_ratio,
+      or_conf_low,
+      or_conf_high,
+      p.value,
+      p.adjust
+    )
+
+
+  # --------------------------------------------------------------------------
+  # Join regression results to counts
+  # --------------------------------------------------------------------------
+
+  supp_table <- model_table %>%
+    dplyr::left_join(
+      count_table,
+      by = c("z_score_bin", "class")
+    ) %>%
+    dplyr::mutate(
+      class = factor(
+        class,
+        levels = outcome_vec
+      ),
+      z_score_bin = factor(
+        z_score_bin,
+        levels = bin_definitions$z_score_bin
+      )
+    ) %>%
+    dplyr::arrange(
+      z_score_bin,
+      class
+    ) %>%
+    dplyr::transmute(
+      z_score_bin = as.character(z_score_bin),
+      class = as.character(class),
+
+      n_total,
+
+      n_z_score_bin,
+      n_z_score_bin_class,
+      n_z_score_bin_other,
+
+      n_outside_z_score_bin,
+      n_outside_z_score_bin_class,
+      n_outside_z_score_bin_other,
+
+      beta,
+      std.error,
+      statistic,
+
+      odds_ratio,
+      or_conf_low,
+      or_conf_high,
+
+      p.value,
+      p.adjust
+    )
+
+
+  # --------------------------------------------------------------------------
+  # Round numerical model results to 3 significant figures
+  # Counts remain exact integers
+  # --------------------------------------------------------------------------
+
+  supp_table <- supp_table %>%
+    dplyr::mutate(
+      dplyr::across(
+        c(
+          beta,
+          std.error,
+          statistic,
+          odds_ratio,
+          or_conf_low,
+          or_conf_high,
+          p.value,
+          p.adjust
+        ),
+        ~ signif(.x, digits = sig_digits)
+      )
+    )
+
+
+  # --------------------------------------------------------------------------
+  # Export numerical table to CSV
+  # --------------------------------------------------------------------------
+
+  write.csv(
+    supp_table,
+    file = csv_file,
+    row.names = FALSE,
+    quote = TRUE
+  )
+
+
+  # --------------------------------------------------------------------------
+  # Formatting helpers for publication table
+  # --------------------------------------------------------------------------
+
+  format_sig <- function(x) {
+
+    vapply(
+      x,
+      function(value) {
+
+        if (is.na(value)) {
+          return(NA_character_)
+        }
+
+        format(
+          signif(value, sig_digits),
+          digits = sig_digits,
+          scientific = FALSE,
+          trim = TRUE
+        )
+      },
+      character(1)
+    )
+  }
+
+
+  format_p <- function(x) {
+
+    vapply(
+      x,
+      function(value) {
+
+        if (is.na(value)) {
+          return(NA_character_)
+        }
+
+        formatC(
+          value,
+          format = "e",
+          digits = sig_digits - 1
+        )
+      },
+      character(1)
+    )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Publication-formatted version for knitr
+  # --------------------------------------------------------------------------
+
+  display_table <- supp_table %>%
+    dplyr::mutate(
+
+      `95% CI` = paste0(
+        format_sig(or_conf_low),
+        "-",
+        format_sig(or_conf_high)
+      ),
+
+      `Beta` = format_sig(beta),
+      `SE` = format_sig(std.error),
+      `Odds ratio` = format_sig(odds_ratio),
+
+      `P value` = format_p(p.value),
+      `Adjusted P value` = format_p(p.adjust)
+    ) %>%
+    dplyr::transmute(
+
+      !!outlier_label := z_score_bin,
+      !!outcome_label := class,
+
+      `N total` = n_total,
+
+      `N in Z-score bin` = n_z_score_bin,
+      `N class in Z-score bin` = n_z_score_bin_class,
+      `N other in Z-score bin` = n_z_score_bin_other,
+
+      `N outside Z-score bin` = n_outside_z_score_bin,
+      `N class outside Z-score bin` = n_outside_z_score_bin_class,
+      `N other outside Z-score bin` = n_outside_z_score_bin_other,
+
+      Beta,
+      SE,
+      `Odds ratio`,
+      `95% CI`,
+      `P value`,
+      `Adjusted P value`
+    )
+
+
+  # --------------------------------------------------------------------------
+  # Print table
+  # --------------------------------------------------------------------------
+
+  print(
+    knitr::kable(
+      display_table,
+      align = c(
+        "l",
+        "l",
+        rep("r", ncol(display_table) - 2)
+      ),
+      caption = paste0(
+        "Logistic regression associations between ",
+        outlier_label,
+        " and ",
+        outcome_label,
+        ". Odds ratios compare observations within each tested Z-score bin ",
+        "with all observations outside that bin. ",
+        "P values are Wald-test P values."
+      )
+    )
+  )
+
+
+  invisible(
+    list(
+      results = supp_table,
+      display = display_table
+    )
+  )
+}

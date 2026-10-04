@@ -32,11 +32,30 @@ def rmse_and_bias(freq, true, infr, max_freq=int(1e6)):
         minlength=max_freq
     )
     numer_rmse = np.bincount(
-        freq[keep], 
-        weights=(infr - true)[keep] ** 2, 
+        freq[keep],
+        weights=(infr - true)[keep] ** 2,
         minlength=max_freq,
     )
     return np.sqrt(numer_rmse / denom), numer_bias / denom
+
+
+def pearson_correlation(freq, true, infr, max_freq=int(1e6)):
+    keep = np.logical_and.reduce([
+        freq > -1,
+        freq < max_freq,
+        ~np.isnan(true),
+        ~np.isnan(infr),
+    ])
+    denom = np.bincount(freq[keep], minlength=max_freq)
+    sum_x = np.bincount(freq[keep], weights=true[keep], minlength=max_freq)
+    sum_y = np.bincount(freq[keep], weights=infr[keep], minlength=max_freq)
+    sum_xx = np.bincount(freq[keep], weights=(true ** 2)[keep], minlength=max_freq)
+    sum_yy = np.bincount(freq[keep], weights=(infr ** 2)[keep], minlength=max_freq)
+    sum_xy = np.bincount(freq[keep], weights=(true * infr)[keep], minlength=max_freq)
+    cov = sum_xy - sum_x * sum_y / denom
+    var_x = sum_xx - sum_x ** 2 / denom
+    var_y = sum_yy - sum_y ** 2 / denom
+    return cov / np.sqrt(var_x * var_y)
 
 
 rule all:
@@ -120,17 +139,47 @@ rule date:
         )
         tszip.compress(variational, output.variational)
         tszip.compress(inside_outside, output.inside_outside)
-      
+
+
+rule date_true:
+    input: trees = rules.simulate.output.trees
+    output: trees = os.path.join(TREES_DIR, "{model}.true_variational.tsz")
+    log: os.path.join(TREES_DIR, "{model}.date_true.log")
+    run:
+        import tsdate
+        import tszip
+        import stdpopsim
+        import logging
+        logging.basicConfig(filename=str(log), filemode="w", level=logging.INFO)
+        homsap = stdpopsim.get_species("HomSap")
+        demogr = homsap.get_demographic_model(wildcards.model)
+        contig = homsap.get_contig(**CONTIG, mutation_rate=demogr.mutation_rate)
+        mu = contig.mutation_rate
+        ts = tszip.load(input.trees)
+        # dating the true topology, so no need to split disjoint nodes via preprocess_ts
+        true_variational = tsdate.date(
+            ts,
+            mutation_rate=mu,
+            max_iterations=EP_ITERATIONS,
+            rescaling_iterations=RESCALING_ITERATIONS,
+            rescaling_intervals=RESCALING_INTERVALS,
+            eps=MIN_BRANCH_LENGTH,
+            set_metadata=False,
+        )
+        tszip.compress(true_variational, output.trees)
+
 
 rule mutations:
     input:
         true = rules.simulate.output.trees,
         variational = rules.date.output.variational,
         inside_outside = rules.date.output.inside_outside,
+        true_variational = rules.date_true.output.trees,
     output:
         true = os.path.join(TREES_DIR, "{model}.true.npy"),
         variational = os.path.join(TREES_DIR, "{model}.variational.npy"),
         inside_outside = os.path.join(TREES_DIR, "{model}.inside_outside.npy"),
+        true_variational = os.path.join(TREES_DIR, "{model}.true_variational.npy"),
         frequency = os.path.join(TREES_DIR, "{model}.frequency.npy"),
     run:
         import tskit
@@ -139,6 +188,7 @@ rule mutations:
         true = tszip.load(input.true)
         variational = tszip.load(input.variational)
         inside_outside = tszip.load(input.inside_outside)
+        true_variational = tszip.load(input.true_variational)
         muts_per_site = np.bincount(variational.mutations_site, minlength=variational.num_sites)
         biallelic = np.flatnonzero(muts_per_site == 1)
         position_map = {variational.sites_position[s]: i for i, s in enumerate(biallelic)}
@@ -167,7 +217,8 @@ rule mutations:
         np.save(output.true, mutation_midpoint_age(true))
         np.save(output.variational, mutation_midpoint_age(variational))
         np.save(output.inside_outside, mutation_midpoint_age(inside_outside))
-        np.save(output.frequency, mutation_frequency(variational)) 
+        np.save(output.true_variational, mutation_midpoint_age(true_variational))
+        np.save(output.frequency, mutation_frequency(variational))
 
                     
 rule plot:
@@ -175,51 +226,65 @@ rule plot:
         true = expand(rules.mutations.output.true, model=MODEL_NAMES),
         variational = expand(rules.mutations.output.variational, model=MODEL_NAMES),
         inside_outside = expand(rules.mutations.output.inside_outside, model=MODEL_NAMES),
+        true_variational = expand(rules.mutations.output.true_variational, model=MODEL_NAMES),
         frequency = expand(rules.mutations.output.frequency, model=MODEL_NAMES),
     output:
         plot = rules.all.input.plot,
     run:
         import matplotlib.pyplot as plt
-        rows, cols = 2, len(MODEL_NAMES)
+        rows, cols = 3, len(MODEL_NAMES)
         fig, axs = plt.subplots(
-            rows, cols, 
+            rows, cols,
             figsize=(2 * cols + 2, 2 * rows + 1),
             sharey="row", sharex=True,
             constrained_layout=True,
         )
-        for i, (tr, va, io, fr, nm) in enumerate(
+        for i, (tr, va, io, tv, fr, nm) in enumerate(
             zip(
-                input.true, 
-                input.variational, 
-                input.inside_outside, 
+                input.true,
+                input.variational,
+                input.inside_outside,
+                input.true_variational,
                 input.frequency,
                 MODEL_NAMES,
             )
-        ): 
-            tr, va, io = [np.log10(np.load(x)) for x in [tr, va, io]]
+        ):
+            tr, va, io, tv = [np.log10(np.load(x)) for x in [tr, va, io, tv]]
             fr = np.load(fr)
             samples = sum(MODELS[nm]["samples"].values())
             max_freq = int(2 * samples * MAX_FREQ)
             va_rmse, va_bias = rmse_and_bias(fr, tr, va, max_freq)
             io_rmse, io_bias = rmse_and_bias(fr, tr, io, max_freq)
-            va_kwargs = {"markersize":2, "color":"dodgerblue", "label":"variational"}
-            io_kwargs = {"markersize":2, "color":"firebrick", "label":"inside-outside"}
+            tv_rmse, tv_bias = rmse_and_bias(fr, tr, tv, max_freq)
+            va_corr = pearson_correlation(fr, tr, va, max_freq)
+            io_corr = pearson_correlation(fr, tr, io, max_freq)
+            tv_corr = pearson_correlation(fr, tr, tv, max_freq)
+            tv_kwargs = {"markersize":2, "color":"dodgerblue", "label":"true+tsdate (variational)"}
+            va_kwargs = {"markersize":2, "color":"firebrick", "label":"tsinfer+tsdate (variational)"}
+            io_kwargs = {"markersize":2, "color":"darkgoldenrod", "label":"tsinfer+tsdate (inside-outside)"}
+            axs[0, i].plot(np.arange(1, max_freq), tv_rmse[1:], "-o", **tv_kwargs)
             axs[0, i].plot(np.arange(1, max_freq), va_rmse[1:], "-o", **va_kwargs)
             axs[0, i].plot(np.arange(1, max_freq), io_rmse[1:], "-o", **io_kwargs)
             axs[0, i].axhline(y=0, color="black", linestyle="dashed")
+            axs[1, i].plot(np.arange(1, max_freq), tv_bias[1:], "-o", **tv_kwargs)
             axs[1, i].plot(np.arange(1, max_freq), va_bias[1:], "-o", **va_kwargs)
             axs[1, i].plot(np.arange(1, max_freq), io_bias[1:], "-o", **io_kwargs)
             axs[1, i].axhline(y=0, color="black", linestyle="dashed")
+            axs[2, i].plot(np.arange(1, max_freq), tv_corr[1:], "-o", **tv_kwargs)
+            axs[2, i].plot(np.arange(1, max_freq), va_corr[1:], "-o", **va_kwargs)
+            axs[2, i].plot(np.arange(1, max_freq), io_corr[1:], "-o", **io_kwargs)
+            axs[2, i].axhline(y=1, color="black", linestyle="dashed")
             axs[0, i].set_title(nm, family="monospace", size=8)
             if i == 0:
                 axs[0, i].set_ylabel("RMSE (log10 age)")
                 axs[1, i].set_ylabel("Bias (log10 age)")
+                axs[2, i].set_ylabel("Correlation (log10 age)")
         fig.supxlabel(f"Mutation frequency (out of {samples} diploids)")
         fig.legend(
             *axs[0, 0].get_legend_handles_labels(),
             loc="outside upper center",
             frameon=False,
-            ncol=2,
+            ncol=3,
         )
         plt.savefig(output.plot)
 
@@ -233,16 +298,22 @@ rule tabulate:
     output:
         table = rules.all.input.table,
     run:
+        abbreviate = {
+            "AmericanAdmixture_4B18": "AA4B18",
+            "OutOfAfricaArchaicAdmixture_5R19": "OOA5R19",
+            "OutOfAfrica_3G09": "OOA3G09",
+            "Zigzag_1S14": "Z1S14",
+        }
         handle = open(output.table, "w")
-        handle.write(r"\begin{tabular}{lcccc}" + "\n")
+        handle.write(r"\begin{tabular}{lccccc}" + "\n")
         handle.write(
-            r" & \multicolumn{2}{c}{Variational} & "
+            r" & & \multicolumn{2}{c}{Variational} & "
             r"\multicolumn{2}{c}{Inside-outside} \\ "
             "\n"
         )
         handle.write(
-            r"\texttt{stdpopsim} model & "
-            r"Bias & RMSE & Bias & RMSE \\ " + "\n"
+            r"model & "
+            r"\# mutations & Bias & RMSE & Bias & RMSE \\ " + "\n"
         )
         handle.write(r"\hline" + "\n")
         for i, (tr, va, io, fr, nm) in enumerate(
@@ -258,6 +329,9 @@ rule tabulate:
             fr = np.load(fr)
             samples = sum(MODELS[nm]["samples"].values())
             max_freq = int(2 * samples * MAX_FREQ)
+            # number of mutations (all and low frequency)
+            n_all = int(np.sum(fr != -1))
+            n_low = int(np.sum((fr != -1) & (fr < max_freq)))
             # low frequency variants
             fr_low = (fr >= max_freq).astype(int)
             fr_low[fr == -1] = -1
@@ -269,7 +343,8 @@ rule tabulate:
             va_all_rmse, va_all_bias = rmse_and_bias(fr_all, tr, va)
             io_all_rmse, io_all_bias = rmse_and_bias(fr_all, tr, io)
             handle.write(
-                r"\texttt{" + nm.replace("_", r"\_") + r"} & " + 
+                r"\texttt{" + abbreviate[nm] + r"} & " +
+                fr"${n_all}$ (${n_low}$) & "
                 fr"${va_all_bias[0]:.2f}$ (${va_low_bias[0]:.2f}$) & "
                 fr"${va_all_rmse[0]:.2f}$ (${va_low_rmse[0]:.2f}$) & "
                 fr"${io_all_bias[0]:.2f}$ (${io_low_bias[0]:.2f}$) & "

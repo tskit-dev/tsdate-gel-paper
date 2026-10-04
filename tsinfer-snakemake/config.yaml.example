@@ -1,0 +1,135 @@
+# File locations - note the {chrom} interpolations, which will be filled by
+# the values from regions below
+
+ancestral_fasta: data/homo_sapiens_ancestor_GRCh38/homo_sapiens_ancestor_{chrom}.fa
+vcf: data/chr{chrom}.vcf.gz
+recomb_map: data/HapMapII_GRCh38/genetic_map_Hg38_chr{chrom}.txt
+
+#Contig names as in the VCF. We use a pattern here as often filenames of
+#fasta/maps are missing prefixes such as in this example
+contig_name: chr{chrom}
+
+# https://www.biostars.org/p/435003/#462800
+regions:
+#  chr1p: 1:1-123400000
+#  chr1q: 1:123400001-248924793
+#  chr2p: 2:1-93900000
+#  chr2q: 2:93900001-242148846
+#  chr3p: 3:1-90900000
+#  chr3q: 3:90900001-198147657
+#  chr4p: 4:1-50000000
+#  chr4q: 4:50000001-190107490
+#  chr5p: 5:1-48800000
+#  chr5q: 5:48800001-181288809
+#  chr6p: 6:1-59800000
+#  chr6q: 6:59800001-170742228
+#  chr7p: 7:1-60100000
+#  chr7q: 7:60100001-159334084
+#  chr8p: 8:1-45200000
+#  chr8q: 8:45200001-145075770
+#  chr9p: 9:1-43000000
+#  chr9q: 9:43000001-138219529
+#  chr10p: 10:1-39800000
+#  chr10q: 10:39800001-133766368
+#  chr11p: 11:1-53400000
+#  chr11q: 11:53400001-135075628
+#  chr12p: 12:1-35500000
+#  chr12q: 12:35500001-133202210
+#  chr13p: 13:1-17700000
+#  chr13q: 13:17700001-114341521
+#  chr14p: 14:1-17200000
+#  chr14q: 14:17200001-106880170
+#  chr15p: 15:1-19000000
+#  chr15q: 15:19000001-101965905
+#  chr16p: 16:1-36800000
+#  chr16q: 16:36800001-90097180
+#  chr17p: 17:1-25100000
+#  chr17q: 17:25100001-83087393
+#  chr18p: 18:1-18500000
+#  chr18q: 18:18500001-80257297
+#  chr19p: 19:1-26200000
+#  chr19q: 19:26200001-58585793
+#  chr20p: 20:1-28100000
+#  chr20q: 20:28100001-64318092
+#  chr21p: 21:1-12000000
+#  chr21q: 21:12000001-46680243
+#  chr22p: 22:1-15000000
+  chr22q: 22:15000001-50791377
+
+
+# A list of the mismatch values to use, note that a non-zero mismatch value
+# results in about 5x slower runtimes.
+mismatch_values: [0, 1.0e-9]
+
+# A list of truncation options to run, note that
+# all zeros disables truncation
+truncate:
+  - lower: 0
+    upper: 0
+    multiplier: 0
+  - lower: 0.4
+    upper: 0.6
+    multiplier: 1
+
+# Pre-tsinfer filters. Each entry is a named filter set that will be run.
+# Any of the filters defined in filters.py can be referenced here.
+# Key names should not contain underscores or hyphens
+filters:
+  filterMinimal:
+    duplicate_position:
+  filterNton23:
+    duplicate_position:
+    not_snps:
+    not_biallelic:
+    bad_ancestral:
+    no_ancestral_allele:
+    low_quality_ancestral_allele:
+    low_allele_count:
+        # Note that any change to these params may not be detected by snakemake
+        min_derived: 2
+        min_ancestral: 3
+    site_density:
+        window_size: 100000
+        threshold_sites_per_kbp: 100
+
+bio2zarr:
+  variants_chunk_size: 20_000
+  num_partitions: 500
+
+match_ancestors:
+# The max number of groups that will be combined into a single job
+  max_groups: 10
+# A unit of work here is a single site for a single ancestor.
+# Ancestor matching will be split into jobs with at least this
+# much work in, if there is that much. A change to this value will have
+# no effect once the match_ancestors_init rule has run
+  min_work_per_job: 100_000_000
+
+match_samples:
+  # Similar to ancestor matching this is the smallest amount of sites
+  # that will be sample matched in a single batch job
+  min_work_per_job: 100_000_000
+  max_num_partitions: 10_000
+
+
+# A list of one or many tsdate parameters to be run
+tsdate:
+  - mutation_rate: 1.29e-8
+  - mutation_rate: 4.2e-8
+
+# Directory to keep output, progress and resume files
+data_dir: "data/workflow"
+
+# Directory to keep temporary files
+temp_dir: "data/workflow/temp"
+
+# A dict of subsets to run
+# Key names will be used in the output file names, the referenced file should
+# be a CSV with a single, header-less column containing the sample IDs to include.
+# Key names should not contain underscores or hyphens
+sample_subsets:
+  subset1: "data/subset.csv"
+  subsetBob: "data/bob_subset.csv"
+
+prefix: ""
+#prefix: "module load python/3.8.2 && source tsinfer-env/bin/activate"

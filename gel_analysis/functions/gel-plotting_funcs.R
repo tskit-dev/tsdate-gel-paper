@@ -280,6 +280,967 @@ plot_coalescence <- function(data, pop_means, order_vec, facet = FALSE, output_f
   return(p)
 }
 
+ecdf_difference_ac_line_plot <- function(
+  df,
+  time_col = "mean_time",
+  group_col = "AM_pred",
+  ac_col = "AC_ts",
+  ac_vals = 1:9,
+  group_vals = c("Likely benign", "Ambiguous", "Likely pathogenic"),
+  reference_group = "Likely benign",
+  filt_cols = NULL,
+  filt_vals = NULL,
+  log10 = TRUE,
+  x_limits = c(0.001, 1000),
+  n_grid = 500,
+  min_n = 20,
+  metric = c("max_positive", "max_abs_signed", "min_negative", "auroc"),
+  colors = NULL,
+  trend_method = "lm",
+  show_se = FALSE,
+  legend_title = "AlphaMissense class",
+  print_counts = TRUE,
+  return_data = FALSE
+) {
+
+  metric <- match.arg(metric)
+
+  parse_ac <- function(x) {
+    suppressWarnings(
+      as.numeric(
+        gsub("[^0-9.]", "", as.character(x))
+      )
+    )
+  }
+
+  auc_from_scores <- function(scores, labels) {
+
+    keep <- is.finite(scores) & !is.na(labels)
+
+    scores <- scores[keep]
+    labels <- labels[keep]
+
+    labels <- as.integer(labels)
+
+    n_pos <- as.double(sum(labels == 1L))
+    n_neg <- as.double(sum(labels == 0L))
+
+    if (n_pos == 0 || n_neg == 0) {
+      return(NA_real_)
+    }
+
+    ranks <- rank(
+      scores,
+      ties.method = "average"
+    )
+
+    sum_ranks_pos <- sum(
+      ranks[labels == 1L]
+    )
+
+    auc <- (
+      sum_ranks_pos -
+        (n_pos * (n_pos + 1) / 2)
+    ) / (n_pos * n_neg)
+
+    as.numeric(auc)
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Filter input data
+  # --------------------------------------------------------------------------
+
+  ac_levels <- parse_ac(ac_vals)
+
+  plot_group_vals <- setdiff(
+    group_vals,
+    reference_group
+  )
+
+  df_filt <- df |>
+    tidyr::drop_na(
+      dplyr::all_of(
+        c(
+          time_col,
+          group_col,
+          ac_col
+        )
+      )
+    ) |>
+    multi_filt_cols(
+      filt_cols = filt_cols,
+      filt_vals = filt_vals
+    ) |>
+    dplyr::mutate(
+      ac_numeric = parse_ac(
+        .data[[ac_col]]
+      )
+    ) |>
+    dplyr::filter(
+      .data[[group_col]] %in% group_vals,
+      ac_numeric %in% ac_levels
+    ) |>
+    dplyr::transmute(
+      time_plot = .data[[time_col]],
+      group_plot = factor(
+        .data[[group_col]],
+        levels = group_vals
+      ),
+      ac_numeric = ac_numeric
+    )
+
+
+  # --------------------------------------------------------------------------
+  # Count variants per AC and group
+  # --------------------------------------------------------------------------
+
+  count_long <- df_filt |>
+    dplyr::mutate(
+      group_plot = as.character(group_plot)
+    ) |>
+    dplyr::count(
+      ac_numeric,
+      group_plot,
+      name = "n_variants"
+    ) |>
+    tidyr::complete(
+      ac_numeric = ac_levels,
+      group_plot = group_vals,
+      fill = list(
+        n_variants = 0
+      )
+    ) |>
+    dplyr::arrange(
+      ac_numeric,
+      factor(
+        group_plot,
+        levels = group_vals
+      )
+    )
+
+
+  count_table <- count_long |>
+    tidyr::pivot_wider(
+      names_from = group_plot,
+      values_from = n_variants,
+      values_fill = 0
+    ) |>
+    dplyr::arrange(
+      ac_numeric
+    ) |>
+    dplyr::mutate(
+      Total = rowSums(
+        dplyr::across(
+          dplyr::all_of(group_vals)
+        )
+      )
+    )
+
+
+  # Grand total row
+  total_row <- count_table |>
+    dplyr::summarise(
+      dplyr::across(
+        dplyr::all_of(
+          c(group_vals, "Total")
+        ),
+        sum
+      )
+    ) |>
+    dplyr::mutate(
+      ac_numeric = NA_real_
+    ) |>
+    dplyr::select(
+      ac_numeric,
+      dplyr::everything()
+    )
+
+
+  count_table_print <- dplyr::bind_rows(
+    count_table,
+    total_row
+  ) |>
+    dplyr::mutate(
+      `Allele count` = dplyr::if_else(
+        is.na(ac_numeric),
+        "Total",
+        as.character(ac_numeric)
+      )
+    ) |>
+    dplyr::select(
+      `Allele count`,
+      dplyr::all_of(group_vals),
+      Total
+    )
+
+
+  if (print_counts) {
+
+    print(
+      knitr::kable(
+        count_table_print,
+        caption = paste0(
+          "Variant counts by allele count and ",
+          legend_title,
+          "."
+        )
+      )
+    )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Transform ages
+  # --------------------------------------------------------------------------
+
+  if (log10) {
+
+    df_filt <- df_filt |>
+      dplyr::filter(
+        time_plot > 0
+      ) |>
+      dplyr::mutate(
+        time_plot = log10(time_plot)
+      )
+
+    x_grid <- seq(
+      log10(x_limits[1]),
+      log10(x_limits[2]),
+      length.out = n_grid
+    )
+
+  } else {
+
+    x_grid <- seq(
+      min(
+        df_filt$time_plot,
+        na.rm = TRUE
+      ),
+      max(
+        df_filt$time_plot,
+        na.rm = TRUE
+      ),
+      length.out = n_grid
+    )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Calculate ECDF/AUROC metrics
+  # --------------------------------------------------------------------------
+
+  line_df <- purrr::map_dfr(
+    ac_levels,
+    function(ac_i) {
+
+      df_ac <- df_filt |>
+        dplyr::filter(
+          ac_numeric == ac_i
+        )
+
+      ref_vals <- df_ac |>
+        dplyr::filter(
+          group_plot == reference_group
+        ) |>
+        dplyr::pull(
+          time_plot
+        )
+
+      if (length(ref_vals) < min_n) {
+        return(NULL)
+      }
+
+      ref_ecdf <- stats::ecdf(
+        ref_vals
+      )
+
+      purrr::map_dfr(
+        plot_group_vals,
+        function(g) {
+
+          vals <- df_ac |>
+            dplyr::filter(
+              group_plot == g
+            ) |>
+            dplyr::pull(
+              time_plot
+            )
+
+          if (length(vals) < min_n) {
+            return(NULL)
+          }
+
+          if (metric == "auroc") {
+
+            # Higher score means "more likely to be focal class".
+            # If focal variants are younger, negative age is the appropriate score.
+
+            scores <- c(
+              -vals,
+              -ref_vals
+            )
+
+            labels <- c(
+              rep(
+                1L,
+                length(vals)
+              ),
+              rep(
+                0L,
+                length(ref_vals)
+              )
+            )
+
+            value <- auc_from_scores(
+              scores,
+              labels
+            )
+
+            age_at_value <- NA_real_
+
+          } else {
+
+            group_ecdf <- stats::ecdf(
+              vals
+            )
+
+            delta <- (
+              group_ecdf(x_grid) -
+                ref_ecdf(x_grid)
+            )
+
+            if (metric == "max_positive") {
+
+              idx <- which.max(
+                delta
+              )
+
+              value <- delta[idx]
+            }
+
+            if (metric == "min_negative") {
+
+              idx <- which.min(
+                delta
+              )
+
+              value <- delta[idx]
+            }
+
+            if (metric == "max_abs_signed") {
+
+              idx <- which.max(
+                abs(delta)
+              )
+
+              value <- delta[idx]
+            }
+
+            age_at_value <- x_grid[idx]
+          }
+
+          tibble::tibble(
+            ac_numeric = ac_i,
+            group_plot = factor(
+              g,
+              levels = plot_group_vals
+            ),
+            metric = metric,
+            metric_value = value,
+            delta_ecdf = if (
+              metric == "auroc"
+            ) {
+              NA_real_
+            } else {
+              value
+            },
+            auroc = if (
+              metric == "auroc"
+            ) {
+              value
+            } else {
+              NA_real_
+            },
+            age_at_delta = if (
+              log10 &&
+                !is.na(age_at_value)
+            ) {
+              10^age_at_value
+            } else {
+              age_at_value
+            },
+            n_group = length(vals),
+            n_reference = length(ref_vals)
+          )
+        }
+      )
+    }
+  )
+
+
+  if (nrow(line_df) == 0) {
+    stop(
+      "No valid AC/class combinations after filtering and applying min_n."
+    )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Labels
+  # --------------------------------------------------------------------------
+
+  metric_y_lab <- dplyr::case_when(
+
+    metric == "max_positive" ~ paste0(
+      "Maximum positive difference in ECDF\nvs ",
+      reference_group
+    ),
+
+    metric == "min_negative" ~ paste0(
+      "Maximum negative difference in ECDF\nvs ",
+      reference_group
+    ),
+
+    metric == "max_abs_signed" ~ paste0(
+      "Maximum absolute signed difference in ECDF\nvs ",
+      reference_group
+    ),
+
+    metric == "auroc" ~ paste0(
+      "AUROC: younger allele age predicts class\nvs ",
+      reference_group
+    )
+  )
+
+
+  baseline <- if (
+    metric == "auroc"
+  ) {
+    0.5
+  } else {
+    0
+  }
+
+
+  y_labels <- if (
+    metric == "auroc"
+  ) {
+    scales::number_format(
+      accuracy = 0.01
+    )
+  } else {
+    scales::percent_format(
+      accuracy = 1
+    )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Plot
+  # --------------------------------------------------------------------------
+
+  p <- ggplot2::ggplot(
+    line_df,
+    ggplot2::aes(
+      x = ac_numeric,
+      y = metric_value,
+      colour = group_plot
+    )
+  ) +
+    ggplot2::geom_hline(
+      yintercept = baseline,
+      linewidth = 0.35,
+      colour = "grey50",
+      linetype = "dashed"
+    ) +
+    ggplot2::geom_point(
+      size = 2.2
+    ) +
+    ggplot2::scale_x_continuous(
+      breaks = ac_levels
+    ) +
+    ggplot2::scale_y_continuous(
+      labels = y_labels
+    ) +
+    ggplot2::theme_classic() +
+    ggplot2::labs(
+      x = "Allele count",
+      y = metric_y_lab,
+      colour = legend_title
+    ) +
+    ggplot2::theme(
+      panel.grid.minor = ggplot2::element_blank(),
+      legend.position = "top",
+      legend.direction = "horizontal",
+      legend.justification = "center",
+      legend.box.just = "center",
+      legend.title = ggplot2::element_text(
+        hjust = 0.5
+      ),
+      legend.text = ggplot2::element_text(
+        hjust = 0.5
+      )
+    ) +
+    ggplot2::guides(
+      colour = ggplot2::guide_legend(
+        title.position = "top",
+        title.hjust = 0.5,
+        nrow = 1,
+        byrow = TRUE
+      )
+    )
+
+
+  if (!is.null(trend_method)) {
+
+    p <- p +
+      ggplot2::geom_smooth(
+        method = trend_method,
+        formula = y ~ x,
+        se = show_se,
+        linewidth = 0.9
+      )
+  }
+
+
+  if (!is.null(colors)) {
+
+    if (is.null(names(colors))) {
+
+      colors <- stats::setNames(
+        colors,
+        group_vals[
+          seq_along(colors)
+        ]
+      )
+    }
+
+    p <- p +
+      ggplot2::scale_colour_manual(
+        values = colors[
+          plot_group_vals
+        ],
+        limits = plot_group_vals,
+        breaks = plot_group_vals,
+        drop = TRUE,
+        guide = ggplot2::guide_legend(
+          title.position = "top",
+          title.hjust = 0.5,
+          nrow = 1,
+          byrow = TRUE
+        )
+      )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Return
+  # --------------------------------------------------------------------------
+
+  if (return_data) {
+
+    return(
+      list(
+        plot = p,
+        data = line_df,
+        counts = count_table,
+        counts_long = count_long
+      )
+    )
+  }
+
+  return(p)
+}
+
+
+ecdf_difference_plot <- function(
+  df,
+  time_col = "mean_time",
+  group_col = "AM_pred",
+  group_vals = c("Likely benign", "Ambiguous", "Likely pathogenic"),
+  reference_group = "Likely benign",
+  filt_cols = NULL,
+  filt_vals = NULL,
+  log10 = TRUE,
+  colors = NULL,
+  x_limits = c(0.001, 1000),
+  n_grid = 500
+) {
+
+  df_filt <- df |>
+    tidyr::drop_na(dplyr::all_of(c(time_col, group_col))) |>
+    multi_filt_cols(
+      filt_cols = filt_cols,
+      filt_vals = filt_vals
+    ) |>
+    dplyr::filter(.data[[group_col]] %in% group_vals) |>
+    dplyr::transmute(
+      time_plot = .data[[time_col]],
+      group_plot = factor(.data[[group_col]], levels = group_vals)
+    )
+
+  if (log10) {
+    df_filt <- df_filt |>
+      dplyr::mutate(time_plot = log10(time_plot))
+
+    x_grid <- seq(
+      log10(x_limits[1]),
+      log10(x_limits[2]),
+      length.out = n_grid
+    )
+  } else {
+    x_grid <- seq(
+      min(df_filt$time_plot, na.rm = TRUE),
+      max(df_filt$time_plot, na.rm = TRUE),
+      length.out = n_grid
+    )
+  }
+
+  ref_vals <- df_filt |>
+    dplyr::filter(group_plot == reference_group) |>
+    dplyr::pull(time_plot)
+
+  ref_ecdf <- stats::ecdf(ref_vals)
+
+  ecdf_df <- purrr::map_dfr(group_vals, function(g) {
+
+    vals <- df_filt |>
+      dplyr::filter(group_plot == g) |>
+      dplyr::pull(time_plot)
+
+    if (length(vals) == 0) {
+      return(NULL)
+    }
+
+    group_ecdf <- stats::ecdf(vals)
+
+    tibble::tibble(
+      group_plot = factor(g, levels = group_vals),
+      time_plot = x_grid,
+      delta_ecdf = group_ecdf(x_grid) - ref_ecdf(x_grid)
+    )
+  }) |>
+    dplyr::filter(group_plot != reference_group)
+
+  p <- ggplot2::ggplot(
+    ecdf_df,
+    ggplot2::aes(
+      x = time_plot,
+      y = delta_ecdf,
+      colour = group_plot
+    )
+  ) +
+    ggplot2::geom_hline(
+      yintercept = 0,
+      linewidth = 0.4,
+      colour = "grey50",
+      linetype = "dashed"
+    ) +
+    ggplot2::geom_line(linewidth = 0.9) +
+    ggplot2::theme_classic() +
+    ggplot2::labs(
+      x = "Allele age (generations)",
+      y = paste0("\u0394 cumulative fraction\nvs ", reference_group),
+      colour = "AlphaMissense prediction"
+    ) +
+    ggplot2::scale_y_continuous(
+      labels = scales::percent_format(accuracy = 1)
+    )
+
+  if (!is.null(colors)) {
+    p <- p +
+      ggplot2::scale_colour_manual(
+        values = colors,
+        drop = FALSE
+      )
+  }
+
+  if (log10) {
+    p <- p +
+      ggplot2::annotation_logticks(
+        linewidth = 0.5,
+        colour = "grey20",
+        short = grid::unit(0.05, "cm"),
+        mid = grid::unit(0.075, "cm"),
+        long = grid::unit(0.1, "cm"),
+        sides = "b"
+      ) +
+      ggplot2::scale_x_continuous(
+        labels = scales::math_format(10^.x),
+      )
+  }
+
+  return(p)
+}
+
+ecdf_difference_by_ac_plot <- function(
+  df,
+  time_col = "mean_time",
+  group_col = "AM_pred",
+  ac_col = "AC_ts",
+  ac_vals = 1:9,
+  group_vals = c("Likely benign", "Ambiguous", "Likely pathogenic"),
+  reference_group = "Likely benign",
+  filt_cols = NULL,
+  filt_vals = NULL,
+  log10 = TRUE,
+  colors = NULL,
+  legend_name = "AlphaMissense class",
+  x_limits = c(1, 10000),
+  n_grid = 500,
+  min_n = 20,
+  annotate_counts = TRUE,
+  count_size = 2.1,
+  count_label_map = c(
+    "Likely benign" = "LB",
+    "Ambiguous" = "Amb",
+    "Likely pathogenic" = "LP"
+  ),
+  return_data = FALSE
+) {
+
+  parse_ac <- function(x) {
+    suppressWarnings(as.numeric(gsub("[^0-9.]", "", as.character(x))))
+  }
+
+  ac_levels <- parse_ac(ac_vals)
+  ac_labels <- paste0("AC = ", ac_levels)
+
+  df_filt <- df |>
+    tidyr::drop_na(dplyr::all_of(c(time_col, group_col, ac_col))) |>
+    multi_filt_cols(
+      filt_cols = filt_cols,
+      filt_vals = filt_vals
+    ) |>
+    dplyr::mutate(
+      ac_numeric = parse_ac(.data[[ac_col]])
+    ) |>
+    dplyr::filter(
+      .data[[group_col]] %in% group_vals,
+      ac_numeric %in% ac_levels
+    ) |>
+    dplyr::transmute(
+      time_plot = .data[[time_col]],
+      group_plot = factor(.data[[group_col]], levels = group_vals),
+      ac_numeric = ac_numeric,
+      ac_plot = factor(
+        paste0("AC = ", ac_numeric),
+        levels = ac_labels
+      )
+    )
+
+  if (log10) {
+    df_filt <- df_filt |>
+      dplyr::filter(time_plot > 0) |>
+      dplyr::mutate(time_plot = log10(time_plot))
+
+    x_grid <- seq(
+      log10(x_limits[1]),
+      log10(x_limits[2]),
+      length.out = n_grid
+    )
+  } else {
+    x_grid <- seq(
+      min(df_filt$time_plot, na.rm = TRUE),
+      max(df_filt$time_plot, na.rm = TRUE),
+      length.out = n_grid
+    )
+  }
+
+  count_df <- tidyr::expand_grid(
+    ac_plot = factor(ac_labels, levels = ac_labels),
+    group_plot = factor(group_vals, levels = group_vals)
+  ) |>
+    dplyr::left_join(
+      df_filt |>
+        dplyr::count(ac_plot, group_plot, name = "n"),
+      by = c("ac_plot", "group_plot")
+    ) |>
+    dplyr::mutate(
+      n = tidyr::replace_na(n, 0L),
+      count_order = match(as.character(group_plot), group_vals),
+      vjust = 1.15 + ((count_order - 1) * 1.15)
+    )
+
+  label_names <- unname(count_label_map[as.character(count_df$group_plot)])
+  label_names[is.na(label_names)] <- as.character(count_df$group_plot)[is.na(label_names)]
+
+  count_df <- count_df |>
+    dplyr::mutate(
+      label = paste0(label_names, " n=", scales::comma(n))
+    )
+
+  ecdf_df <- purrr::map_dfr(levels(df_filt$ac_plot), function(ac_i) {
+
+    df_ac <- df_filt |>
+      dplyr::filter(ac_plot == ac_i)
+
+    ref_vals <- df_ac |>
+      dplyr::filter(group_plot == reference_group) |>
+      dplyr::pull(time_plot)
+
+    if (length(ref_vals) < min_n) {
+      return(NULL)
+    }
+
+    ref_ecdf <- stats::ecdf(ref_vals)
+
+    purrr::map_dfr(group_vals, function(g) {
+
+      if (g == reference_group) {
+        return(NULL)
+      }
+
+      vals <- df_ac |>
+        dplyr::filter(group_plot == g) |>
+        dplyr::pull(time_plot)
+
+      if (length(vals) < min_n) {
+        return(NULL)
+      }
+
+      group_ecdf <- stats::ecdf(vals)
+
+      tibble::tibble(
+        ac_plot = factor(ac_i, levels = ac_labels),
+        group_plot = factor(g, levels = group_vals),
+        time_plot = x_grid,
+        delta_ecdf = group_ecdf(x_grid) - ref_ecdf(x_grid),
+        n_group = length(vals),
+        n_reference = length(ref_vals)
+      )
+    })
+  })
+
+  reference_colour <- "grey50"
+
+  if (!is.null(colors) && reference_group %in% names(colors)) {
+    reference_colour <- unname(colors[reference_group])
+  }
+
+  legend_df <- tibble::tibble(
+    time_plot = x_grid[1],
+    delta_ecdf = 0,
+    group_plot = factor(group_vals, levels = group_vals)
+  )
+
+  p <- ggplot2::ggplot(
+    ecdf_df,
+    ggplot2::aes(
+      x = time_plot,
+      y = delta_ecdf,
+      colour = group_plot
+    )
+  ) +
+    ggplot2::geom_hline(
+      yintercept = 0,
+      linewidth = 0.3,
+      colour = reference_colour,
+      linetype = "solid"
+    ) +
+    ggplot2::geom_line(
+      linewidth = 0.3,
+      show.legend = FALSE
+    ) +
+    ggplot2::geom_point(
+      data = legend_df,
+      ggplot2::aes(
+        x = time_plot,
+        y = delta_ecdf,
+        fill = group_plot
+      ),
+      shape = 22,
+      colour = "grey20",
+      size = 4,
+      alpha = 0,
+      inherit.aes = FALSE,
+      show.legend = TRUE
+    ) +
+    ggplot2::facet_wrap(
+      ~ ac_plot,
+      nrow = 1
+    ) +
+    ggplot2::theme_classic() +
+    ggplot2::labs(
+      x = "Allele age (generations)",
+      y = paste0("\u0394 cumulative fraction\nvs ", reference_group),
+      fill = legend_name
+    ) +
+    ggplot2::scale_y_continuous(
+      labels = scales::percent_format(accuracy = 1)
+    )
+
+  if (annotate_counts) {
+    p <- p +
+      ggplot2::geom_text(
+        data = count_df,
+        ggplot2::aes(
+          x = Inf,
+          y = Inf,
+          label = label,
+          colour = group_plot,
+          vjust = vjust
+        ),
+        hjust = 1.05,
+        size = count_size,
+        inherit.aes = FALSE,
+        show.legend = FALSE
+      )
+  }
+
+  if (!is.null(colors)) {
+    p <- p +
+      ggplot2::scale_colour_manual(
+        values = colors,
+        limits = group_vals,
+        breaks = group_vals,
+        drop = FALSE,
+        guide = "none"
+      ) +
+      ggplot2::scale_fill_manual(
+        values = colors,
+        limits = group_vals,
+        breaks = group_vals,
+        drop = FALSE,
+        guide = ggplot2::guide_legend(
+          override.aes = list(
+            alpha = 1,
+            shape = 22,
+            size = 5,
+            colour = "grey20"
+          )
+        )
+      )
+  }
+
+  if (log10) {
+    p <- p +
+      ggplot2::annotation_logticks(
+        linewidth = 0.4,
+        colour = "grey20",
+        short = grid::unit(0.04, "cm"),
+        mid = grid::unit(0.06, "cm"),
+        long = grid::unit(0.08, "cm"),
+        sides = "b"
+      ) +
+      ggplot2::scale_x_continuous(
+        labels = scales::math_format(10^.x),
+        limits = log10(x_limits)
+      )
+  }
+
+  if (return_data) {
+    return(list(
+      plot = p,
+      data = ecdf_df,
+      counts = count_df
+    ))
+  }
+
+  return(p)
+}
+
 grouped_density_plot <- function(
   df,
   time_col = "mean_time",
@@ -289,69 +1250,315 @@ grouped_density_plot <- function(
   filt_vals = NULL,
   log10 = TRUE,
   flip = FALSE,
-  discrete = FALSE
+  discrete = FALSE,
+  colors = NULL
 ) {
 
-  time_sym <- rlang::sym(time_col)
-  group_sym <- rlang::sym(group_col)
-  
   ## Filter columns
   df_filt <- df |>
-  drop_na({{time_sym}}, {{group_sym}}) |>
-  multi_filt_cols(
-    filt_cols = filt_cols,
-    filt_vals = filt_vals
-  ) |>
-  filter({{group_sym}} %in% group_vals)
+    tidyr::drop_na(dplyr::all_of(c(time_col, group_col))) |>
+    multi_filt_cols(
+      filt_cols = filt_cols,
+      filt_vals = filt_vals
+    ) |>
+    dplyr::filter(.data[[group_col]] %in% group_vals)
 
+  ## Log10 transform time variable
   if (log10) {
-    df_filt %<>% mutate({{time_sym}} := log10({{time_sym}}))
+    df_filt <- df_filt |>
+      dplyr::filter(.data[[time_col]] > 0) |>
+      dplyr::mutate("{time_col}" := log10(.data[[time_col]]))
   }
 
+  ## Convert grouping variable to ordered factor if required
   if (discrete) {
-    df_filt %<>% mutate({{group_sym}} := factor({{group_sym}}, levels = group_vals))
+    df_filt <- df_filt |>
+      dplyr::mutate(
+        "{group_col}" := factor(.data[[group_col]], levels = group_vals)
+      )
   }
 
-  if(flip) {
+  ## Make sure colour vector follows group_vals order
+  if (!is.null(colors)) {
+    if (!is.null(names(colors))) {
+      colors <- colors[group_vals]
+    } else {
+      colors <- stats::setNames(colors, group_vals)
+    }
+  }
+
+  ## Dummy data for filled-square legend
+  legend_time <- if (log10) log10(0.001) else min(df_filt[[time_col]], na.rm = TRUE)
+
+  legend_df <- tibble::tibble(
+    time_legend = legend_time,
+    density_legend = 0,
+    group_legend = factor(group_vals, levels = group_vals)
+  )
+
+  ## Build plot
+  if (flip) {
     plot <- df_filt |>
-      ggplot(
-        aes(
-          y = {{time_sym}},
-          group = {{group_sym}},
-          colour = {{group_sym}}
+      ggplot2::ggplot(
+        ggplot2::aes(
+          y = .data[[time_col]],
+          group = .data[[group_col]],
+          colour = .data[[group_col]]
         )
+      ) +
+      ggplot2::geom_point(
+        data = legend_df,
+        ggplot2::aes(
+          x = density_legend,
+          y = time_legend,
+          colour = group_legend,
+          fill = group_legend
+        ),
+        shape = 22,
+        size = 4,
+        alpha = 0,
+        inherit.aes = FALSE,
+        show.legend = TRUE
       )
   } else {
     plot <- df_filt |>
-      ggplot(
-        aes(
-          x = {{time_sym}},
-          group = {{group_sym}},
-          colour = {{group_sym}}
+      ggplot2::ggplot(
+        ggplot2::aes(
+          x = .data[[time_col]],
+          group = .data[[group_col]],
+          colour = .data[[group_col]]
         )
+      ) +
+      ggplot2::geom_point(
+        data = legend_df,
+        ggplot2::aes(
+          x = time_legend,
+          y = density_legend,
+          colour = group_legend,
+          fill = group_legend
+        ),
+        shape = 22,
+        size = 4,
+        alpha = 0,
+        inherit.aes = FALSE,
+        show.legend = TRUE
       )
   }
 
   plot <- plot +
-  geom_density() +
-  theme_classic() +
-  scale_y_continuous(expand = c(0,0))
+    ggplot2::geom_density(
+      linewidth = 0.6,
+      fill = NA,
+      show.legend = FALSE
+    ) +
+    ggplot2::theme_classic()
 
-  if (log10) {
+  ## Manual colours/fills with filled legend boxes
+  if (!is.null(colors)) {
     plot <- plot +
-      annotation_logticks(
+      ggplot2::scale_colour_manual(
+        values = colors,
+        limits = group_vals,
+        breaks = group_vals,
+        drop = FALSE,
+        guide = ggplot2::guide_legend(
+          override.aes = list(
+            alpha = 1,
+            shape = 22,
+            size = 5,
+            fill = unname(colors[group_vals]),
+            colour = "grey20",
+            linewidth = 0
+          )
+        )
+      ) +
+      ggplot2::scale_fill_manual(
+        values = colors,
+        limits = group_vals,
+        breaks = group_vals,
+        drop = FALSE,
+        guide = "none"
+      )
+  }
+
+  ## Expand density axis to zero
+  if (flip) {
+    plot <- plot +
+      ggplot2::scale_x_continuous(expand = c(0, 0))
+  } else {
+    plot <- plot +
+      ggplot2::scale_y_continuous(expand = c(0, 0))
+  }
+
+  ## Log10 axis formatting
+  if (log10 && !flip) {
+    plot <- plot +
+      ggplot2::annotation_logticks(
         linewidth = 0.5,
         colour = "grey20",
-        short = unit(0.05, "cm"),
-        mid = unit(0.075, "cm"),
-        long = unit(0.1, "cm"),
+        short = grid::unit(0.05, "cm"),
+        mid = grid::unit(0.075, "cm"),
+        long = grid::unit(0.1, "cm"),
         sides = "b"
       ) +
-      scale_x_continuous(
+      ggplot2::scale_x_continuous(
         labels = scales::math_format(10^.x),
         limits = c(log10(0.001), log10(1000))
-      ) 
+      )
   }
+
+  if (log10 && flip) {
+    plot <- plot +
+      ggplot2::annotation_logticks(
+        linewidth = 0.5,
+        colour = "grey20",
+        short = grid::unit(0.05, "cm"),
+        mid = grid::unit(0.075, "cm"),
+        long = grid::unit(0.1, "cm"),
+        sides = "l"
+      ) +
+      ggplot2::scale_y_continuous(
+        labels = scales::math_format(10^.x),
+        limits = c(log10(0.001), log10(1000))
+      )
+  }
+
+  return(plot)
+}
+
+grouped_ecdf_plot <- function(
+  df,
+  time_col = "mean_time",
+  group_col = "AC_ts",
+  group_vals = c(1:9),
+  filt_cols = NULL,
+  filt_vals = NULL,
+  log10 = TRUE,
+  discrete = FALSE,
+  colors = NULL,
+  x_limits = c(0.001, 1000)
+) {
+
+  ## Filter columns
+  df_filt <- df |>
+    tidyr::drop_na(dplyr::all_of(c(time_col, group_col))) |>
+    multi_filt_cols(
+      filt_cols = filt_cols,
+      filt_vals = filt_vals
+    ) |>
+    dplyr::filter(.data[[group_col]] %in% group_vals)
+
+  ## Log10 transform time variable
+  if (log10) {
+    df_filt <- df_filt |>
+      dplyr::filter(.data[[time_col]] > 0) |>
+      dplyr::mutate("{time_col}" := log10(.data[[time_col]]))
+  }
+
+  ## Convert grouping variable to ordered factor if required
+  if (discrete) {
+    df_filt <- df_filt |>
+      dplyr::mutate(
+        "{group_col}" := factor(.data[[group_col]], levels = group_vals)
+      )
+  }
+
+  ## Make sure colour vector follows group_vals order
+  if (!is.null(colors)) {
+    if (!is.null(names(colors))) {
+      colors <- colors[group_vals]
+    } else {
+      colors <- stats::setNames(colors, group_vals)
+    }
+  }
+
+  ## Dummy data for filled-square legend
+  legend_time <- if (log10) log10(x_limits[1]) else min(df_filt[[time_col]], na.rm = TRUE)
+
+  legend_df <- tibble::tibble(
+    time_legend = legend_time,
+    ecdf_legend = 0,
+    group_legend = factor(group_vals, levels = group_vals)
+  )
+
+  plot <- df_filt |>
+    ggplot2::ggplot(
+      ggplot2::aes(
+        x = .data[[time_col]],
+        colour = .data[[group_col]]
+      )
+    ) +
+    ggplot2::geom_point(
+      data = legend_df,
+      ggplot2::aes(
+        x = time_legend,
+        y = ecdf_legend,
+        colour = group_legend,
+        fill = group_legend
+      ),
+      shape = 22,
+      size = 4,
+      alpha = 0,
+      inherit.aes = FALSE,
+      show.legend = TRUE
+    ) +
+    ggplot2::stat_ecdf(
+      geom = "step",
+      linewidth = 0.6,
+      show.legend = FALSE
+    ) +
+    ggplot2::theme_classic() +
+    ggplot2::scale_y_continuous(
+      labels = scales::percent_format(accuracy = 1),
+      limits = c(0, 1),
+      expand = c(0, 0)
+    )
+
+  ## Manual colours/fills with filled legend boxes
+  if (!is.null(colors)) {
+    plot <- plot +
+      ggplot2::scale_colour_manual(
+        values = colors,
+        limits = group_vals,
+        breaks = group_vals,
+        drop = FALSE,
+        guide = ggplot2::guide_legend(
+          override.aes = list(
+            alpha = 1,
+            shape = 22,
+            size = 5,
+            fill = unname(colors[group_vals]),
+            colour = "grey20",
+            linewidth = 0
+          )
+        )
+      ) +
+      ggplot2::scale_fill_manual(
+        values = colors,
+        limits = group_vals,
+        breaks = group_vals,
+        drop = FALSE,
+        guide = "none"
+      )
+  }
+
+  ## Log10 axis formatting
+  if (log10) {
+    plot <- plot +
+      ggplot2::annotation_logticks(
+        linewidth = 0.5,
+        colour = "grey20",
+        short = grid::unit(0.05, "cm"),
+        mid = grid::unit(0.075, "cm"),
+        long = grid::unit(0.1, "cm"),
+        sides = "b"
+      ) +
+      ggplot2::scale_x_continuous(
+        labels = scales::math_format(10^.x),
+        limits = log10(x_limits)
+      )
+  }
+
   return(plot)
 }
 
@@ -374,19 +1581,156 @@ create_joint_density_plot <- function(
   cor_colour = "black"
 ) {
 
+  # ---------------------------------------------------------------------------
+  # Calculate correlation
+  # ---------------------------------------------------------------------------
+
+  cor_data <- to_plot |>
+    dplyr::filter(
+      complete.cases(
+        geometric_mean_age_singletons,
+        number_of_singletons
+      )
+    )
+
+  cor_test <- cor.test(
+    cor_data$geometric_mean_age_singletons,
+    cor_data$number_of_singletons,
+    method = cor_method
+  )
+
+  cor_coef <- unname(cor_test$estimate)
+
+  # Correlation coefficient to 3 decimal places
+  cor_coef_formatted <- sprintf("%.3f", cor_coef)
+
+
+  # ---------------------------------------------------------------------------
+  # Format P value
+  #
+  # For extremely small Pearson P values, cor.test() can underflow to zero.
+  # Calculate the P value on the log scale instead so values far below
+  # double-precision limits can still be handled.
+  #
+  # For plotting, truncate anything smaller than 1e-300 to:
+  # P < 1e-300
+  # ---------------------------------------------------------------------------
+
+  if (cor_method == "pearson") {
+
+    t_stat <- unname(cor_test$statistic)
+    df <- unname(cor_test$parameter)
+
+    # Two-sided log(P)
+    log_p <- log(2) +
+      pt(
+        abs(t_stat),
+        df = df,
+        lower.tail = FALSE,
+        log.p = TRUE
+      )
+
+    # Convert to log10(P)
+    log10_p <- log_p / log(10)
+
+    if (log10_p < -300) {
+
+      cor_p_formatted <- "< 1e-300"
+
+    } else {
+
+      exponent <- floor(log10_p)
+      mantissa <- 10^(log10_p - exponent)
+
+      # Protect against rounding 9.999... to 10.00
+      if (round(mantissa, 2) >= 10) {
+        mantissa <- 1
+        exponent <- exponent + 1
+      }
+
+      cor_p_formatted <- sprintf(
+        "%.2fe%d",
+        mantissa,
+        exponent
+      )
+    }
+
+  } else {
+
+    # For non-Pearson tests, use the P value returned by cor.test()
+    cor_p <- cor_test$p.value
+
+    if (cor_p == 0 || cor_p < 1e-300) {
+
+      cor_p_formatted <- "< 1e-300"
+
+    } else {
+
+      cor_p_formatted <- formatC(
+        cor_p,
+        format = "e",
+        digits = 2
+      )
+
+      cor_p_formatted <- sub(
+        "e\\+?",
+        "e",
+        cor_p_formatted
+      )
+    }
+  }
+
+
+  # ---------------------------------------------------------------------------
+  # Appropriate correlation label
+  # ---------------------------------------------------------------------------
+
+  cor_method_label <- switch(
+    cor_method,
+    pearson = "Pearson's r",
+    spearman = "Spearman's rho",
+    kendall = "Kendall's tau",
+    cor_method
+  )
+
+  # P value below correlation coefficient
+  cor_label <- paste0(
+    cor_method_label,
+    " = ",
+    cor_coef_formatted,
+    "\nP ",
+    ifelse(
+      grepl("^<", cor_p_formatted),
+      cor_p_formatted,
+      paste0("= ", cor_p_formatted)
+    )
+  )
+
+
+  # ---------------------------------------------------------------------------
   # Create central plot
+  # ---------------------------------------------------------------------------
+
   combined_plot <- to_plot |>
-    ggplot(aes(
-      x = geometric_mean_age_singletons,
-      y = number_of_singletons,
-    )) +
-    geom_hex(bins = bins) +
-    theme_classic(base_size = 20) +
-    theme(
-      legend.position = "NONE",
-      #plot.margin = unit(c(0, 0, 0, 0), 'lines')
+    ggplot(
+      aes(
+        x = geometric_mean_age_singletons,
+        y = number_of_singletons
+      )
     ) +
-    scale_fill_viridis(option = "plasma", trans = "log") +
+    geom_hex(
+      bins = bins
+    ) +
+    theme_classic(
+      base_size = 20
+    ) +
+    theme(
+      legend.position = "NONE"
+    ) +
+    scale_fill_viridis(
+      option = "plasma",
+      trans = "log"
+    ) +
     labs(
       x = "Geometric mean singleton age (generations)",
       y = expression("Number of singletons")
@@ -398,79 +1742,117 @@ create_joint_density_plot <- function(
       colour = smooth_colour,
       linetype = smooth_linetype
     ) +
-    stat_cor(
-      method = "spearman",
-      #cor.coef.name = "Spearmans rank",
-      label.x = cor_label_x,
-      label.y = cor_label_y,
+    annotate(
+      "text",
+      x = cor_label_x,
+      y = cor_label_y,
+      label = cor_label,
       size = cor_size,
-      colour = cor_colour
+      colour = cor_colour,
+      hjust = 0
     ) +
-    scale_x_continuous(expand = c(0,0), limits = c(0, 220)) +
-    scale_y_continuous(limits = c(0, NA), expand = c(0, 0))
+    scale_x_continuous(
+      expand = c(0, 0),
+      limits = c(0, 220)
+    ) +
+    scale_y_continuous(
+      limits = c(0, NA),
+      expand = c(0, 0)
+    )
+
+
+  # ---------------------------------------------------------------------------
+  # Highlight individual sample
+  # ---------------------------------------------------------------------------
 
   if (!is.null(highlight_id)) {
-    to_plot |> filter(singleton_sample_id == highlight_id) -> to_highlight
+
+    to_highlight <- to_plot |>
+      dplyr::filter(
+        singleton_sample_id == highlight_id
+      )
+
     combined_plot <- combined_plot +
-    geom_point(
-      data = to_highlight,
-      shape = 21,
-      size = 7,
-      stroke = 1.1,
-      colour = "black"
-    ) +
-    geom_text(
-      data = to_highlight,
-      label = sample_name,
-      colour = "black",
-      size = 7,
-      hjust = -0.2, vjust = -0.1
+      geom_point(
+        data = to_highlight,
+        shape = 21,
+        size = 7,
+        stroke = 1.1,
+        colour = "black"
+      ) +
+      geom_text(
+        data = to_highlight,
+        label = sample_name,
+        colour = "black",
+        size = 7,
+        hjust = -0.2,
+        vjust = -0.1
+      )
+  }
+
+
+  # ---------------------------------------------------------------------------
+  # Add population-specific marginal density plots
+  # ---------------------------------------------------------------------------
+
+  if (include_group_hists) {
+
+    # X density plot
+    xplot <- to_plot |>
+      grouped_density_plot(
+        time_col = "geometric_mean_age_singletons",
+        group_col = "pop",
+        group_vals = group_numbers$pop,
+        log10 = FALSE,
+        flip = FALSE
+      ) +
+      scale_colour_manual(
+        values = pop_colours_vec
+      ) +
+      theme_void() +
+      theme(
+        legend.position = "NONE",
+        plot.margin = unit(
+          c(0, 0, 0, 0),
+          "lines"
+        )
+      )
+
+    # Y density plot
+    yplot <- to_plot |>
+      grouped_density_plot(
+        time_col = "number_of_singletons",
+        group_col = "pop",
+        group_vals = group_numbers$pop,
+        log10 = FALSE,
+        flip = TRUE
+      ) +
+      scale_colour_manual(
+        values = pop_colours_vec
+      ) +
+      theme_void() +
+      theme(
+        legend.position = "NONE",
+        plot.margin = unit(
+          c(0, 0, 0, 0),
+          "lines"
+        )
+      )
+
+    # Combine plots
+    combined_plot <- ggarrange(
+      xplot,
+      NULL,
+      combined_plot,
+      yplot,
+      ncol = 2,
+      nrow = 2,
+      align = "hv",
+      widths = c(1, 0.6),
+      heights = c(0.4, 1)
     )
   }
 
-  if(include_group_hists) {
-    # Create xplot
-  xplot <- to_plot |>
-    grouped_density_plot(
-      time_col = "geometric_mean_age_singletons",
-      group_col = "pop",
-      group_vals = group_numbers$pop,
-      log10 = FALSE,
-      flip = FALSE
-    ) +
-    scale_colour_manual(values = pop_colours_vec) +
-    theme_void() +
-    theme(
-      legend.position = "NONE",
-      plot.margin = unit(c(0, 0, 0, 0), 'lines')
-    )
-
-  # Create yplot
-  yplot <- to_plot |>
-    grouped_density_plot(
-      time_col = "number_of_singletons",
-      group_col = "pop",
-      group_vals = group_numbers$pop,
-      log10 = FALSE,
-      flip = TRUE
-    ) +
-    scale_colour_manual(values = pop_colours_vec) +
-    theme_void() +
-    theme(
-      legend.position = "NONE",
-      plot.margin = unit(c(0, 0, 0, 0), 'lines')
-    )
-
-  # Combine plots
-  combined_plot <- ggarrange(
-    xplot, NULL,
-    combined_plot, yplot,
-    ncol = 2, nrow = 2,
-    align = "hv",
-    widths = c(1, 0.6),
-    heights = c(0.4, 1)
-  )
-  }
 
   return(combined_plot)
 }
