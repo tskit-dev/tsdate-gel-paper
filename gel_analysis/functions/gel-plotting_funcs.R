@@ -974,6 +974,7 @@ ecdf_difference_plot <- function(
   return(p)
 }
 
+
 ecdf_difference_by_ac_plot <- function(
   df,
   time_col = "mean_time",
@@ -991,12 +992,7 @@ ecdf_difference_by_ac_plot <- function(
   n_grid = 500,
   min_n = 20,
   annotate_counts = TRUE,
-  count_size = 2.1,
-  count_label_map = c(
-    "Likely benign" = "LB",
-    "Ambiguous" = "Amb",
-    "Likely pathogenic" = "LP"
-  ),
+  count_size = 10,
   return_data = FALSE
 ) {
 
@@ -1031,16 +1027,21 @@ ecdf_difference_by_ac_plot <- function(
     )
 
   if (log10) {
+
     df_filt <- df_filt |>
       dplyr::filter(time_plot > 0) |>
-      dplyr::mutate(time_plot = log10(time_plot))
+      dplyr::mutate(
+        time_plot = log10(time_plot)
+      )
 
     x_grid <- seq(
       log10(x_limits[1]),
       log10(x_limits[2]),
       length.out = n_grid
     )
+
   } else {
+
     x_grid <- seq(
       min(df_filt$time_plot, na.rm = TRUE),
       max(df_filt$time_plot, na.rm = TRUE),
@@ -1054,64 +1055,67 @@ ecdf_difference_by_ac_plot <- function(
   ) |>
     dplyr::left_join(
       df_filt |>
-        dplyr::count(ac_plot, group_plot, name = "n"),
+        dplyr::count(
+          ac_plot,
+          group_plot,
+          name = "n"
+        ),
       by = c("ac_plot", "group_plot")
     ) |>
     dplyr::mutate(
       n = tidyr::replace_na(n, 0L),
       count_order = match(as.character(group_plot), group_vals),
-      vjust = 1.15 + ((count_order - 1) * 1.15)
+      vjust = 1.15 + ((count_order - 1) * 1.15),
+      label = scales::comma(n)
     )
 
-  label_names <- unname(count_label_map[as.character(count_df$group_plot)])
-  label_names[is.na(label_names)] <- as.character(count_df$group_plot)[is.na(label_names)]
+  ecdf_df <- purrr::map_dfr(
+    levels(df_filt$ac_plot),
+    function(ac_i) {
 
-  count_df <- count_df |>
-    dplyr::mutate(
-      label = paste0(label_names, " n=", scales::comma(n))
-    )
+      df_ac <- df_filt |>
+        dplyr::filter(ac_plot == ac_i)
 
-  ecdf_df <- purrr::map_dfr(levels(df_filt$ac_plot), function(ac_i) {
-
-    df_ac <- df_filt |>
-      dplyr::filter(ac_plot == ac_i)
-
-    ref_vals <- df_ac |>
-      dplyr::filter(group_plot == reference_group) |>
-      dplyr::pull(time_plot)
-
-    if (length(ref_vals) < min_n) {
-      return(NULL)
-    }
-
-    ref_ecdf <- stats::ecdf(ref_vals)
-
-    purrr::map_dfr(group_vals, function(g) {
-
-      if (g == reference_group) {
-        return(NULL)
-      }
-
-      vals <- df_ac |>
-        dplyr::filter(group_plot == g) |>
+      ref_vals <- df_ac |>
+        dplyr::filter(group_plot == reference_group) |>
         dplyr::pull(time_plot)
 
-      if (length(vals) < min_n) {
+      if (length(ref_vals) < min_n) {
         return(NULL)
       }
 
-      group_ecdf <- stats::ecdf(vals)
+      ref_ecdf <- stats::ecdf(ref_vals)
 
-      tibble::tibble(
-        ac_plot = factor(ac_i, levels = ac_labels),
-        group_plot = factor(g, levels = group_vals),
-        time_plot = x_grid,
-        delta_ecdf = group_ecdf(x_grid) - ref_ecdf(x_grid),
-        n_group = length(vals),
-        n_reference = length(ref_vals)
+      purrr::map_dfr(
+        group_vals,
+        function(g) {
+
+          if (g == reference_group) {
+            return(NULL)
+          }
+
+          vals <- df_ac |>
+            dplyr::filter(group_plot == g) |>
+            dplyr::pull(time_plot)
+
+          if (length(vals) < min_n) {
+            return(NULL)
+          }
+
+          group_ecdf <- stats::ecdf(vals)
+
+          tibble::tibble(
+            ac_plot = factor(ac_i, levels = ac_labels),
+            group_plot = factor(g, levels = group_vals),
+            time_plot = x_grid,
+            delta_ecdf = group_ecdf(x_grid) - ref_ecdf(x_grid),
+            n_group = length(vals),
+            n_reference = length(ref_vals)
+          )
+        }
       )
-    })
-  })
+    }
+  )
 
   reference_colour <- "grey50"
 
@@ -1164,14 +1168,20 @@ ecdf_difference_by_ac_plot <- function(
     ggplot2::theme_classic() +
     ggplot2::labs(
       x = "Allele age (generations)",
-      y = paste0("\u0394 cumulative fraction\nvs ", reference_group),
+      y = paste0(
+        "\u0394 cumulative fraction\nvs ",
+        reference_group
+      ),
       fill = legend_name
     ) +
     ggplot2::scale_y_continuous(
-      labels = scales::percent_format(accuracy = 1)
+      labels = scales::percent_format(
+        accuracy = 1
+      )
     )
 
   if (annotate_counts) {
+
     p <- p +
       ggplot2::geom_text(
         data = count_df,
@@ -1184,12 +1194,14 @@ ecdf_difference_by_ac_plot <- function(
         ),
         hjust = 1.05,
         size = count_size,
+        size.unit = "pt",
         inherit.aes = FALSE,
         show.legend = FALSE
       )
   }
 
   if (!is.null(colors)) {
+
     p <- p +
       ggplot2::scale_colour_manual(
         values = colors,
@@ -1215,6 +1227,7 @@ ecdf_difference_by_ac_plot <- function(
   }
 
   if (log10) {
+
     p <- p +
       ggplot2::annotation_logticks(
         linewidth = 0.4,
@@ -1225,21 +1238,29 @@ ecdf_difference_by_ac_plot <- function(
         sides = "b"
       ) +
       ggplot2::scale_x_continuous(
-        labels = scales::math_format(10^.x),
+        breaks = seq(
+          floor(log10(x_limits[1])),
+          ceiling(log10(x_limits[2])),
+          by = 1
+        ),
         limits = log10(x_limits)
       )
   }
 
   if (return_data) {
-    return(list(
-      plot = p,
-      data = ecdf_df,
-      counts = count_df
-    ))
+
+    return(
+      list(
+        plot = p,
+        data = ecdf_df,
+        counts = count_df
+      )
+    )
   }
 
   return(p)
 }
+
 
 grouped_density_plot <- function(
   df,
