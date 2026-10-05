@@ -161,219 +161,6 @@ z_normalise(
     )
 ```
 
-
-## Constraint Z-score plot
-gnomADv3.1 released Z-scores showing mutational constraint across chromosomes
-We can take a look at if there is any enrichment/depletion of allele frequency / allele age outliers (Z-scores) within constraint Z-score bins.
-
-```{r}
-## takes a while, checkpoint
-checkpoint_gnocchi_regress <- paste0(
-  paths$output_dir,
-  "checkpoints/all-chr17-gnocchi_z-regression.tsv.gz"
-)
-
-cat("Gnocchi checkpoint:", checkpoint_gnocchi_regress, "\n")
-
-if (file.exists(checkpoint_gnocchi_regress)) {
-
-  cat("Loading existing Gnocchi regression checkpoint\n")
-
-  gnocchi_logistic_test_between_z <- data.table::fread(
-    checkpoint_gnocchi_regress
-  )
-
-} else {
-
-  cat("Checkpoint not found; running Gnocchi regressions\n")
-
-  gnocchi_logistic_test_between_z <-
-    outlier_logistic_loop_wrapper(
-      df = ts_lf_merge %>%
-        filter(chromosome == "chr17"),
-      outcome_col = "gnocchi_z",
-      outcome_vec = c(
-        "<n4", "n3-n4", "n2-n3", "n1-n2",
-        "0-n1", "0-1", "1-2", "2-3", "3-4", ">=4"
-      ),
-      outlier_thresh_vec = c(-Inf, 0, 1, 2, 3, 4, Inf),
-      outlier_col = "time_z",
-      group_vals = 1:max_ac_count(
-        ts_lf_merge,
-        AF_thresh = 0.001
-      ),
-      group_col = "AC_ts",
-      direction = "between",
-      correct_groups = FALSE,
-      group_as_factor = FALSE
-    )
-
-  data.table::fwrite(
-    gnocchi_logistic_test_between_z,
-    checkpoint_gnocchi_regress,
-    sep = "\t"
-  )
-}
-
-gnocchi_logistic_test_between_z %<>%
-  mutate(
-    outlier_score = gsub(
-      " - ",
-      " to ",
-      outlier_score
-    ),
-    outlier_score = case_when(
-      outlier_score == "-Inf to 0" ~ "< 0",
-      outlier_score == "4 to Inf" ~ "> 4",
-      TRUE ~ outlier_score
-    )
-  )
-```
-
-```{r}
-cat("Gnocchi results dimensions:",
-    nrow(gnocchi_logistic_test_between_z),
-    "x",
-    ncol(gnocchi_logistic_test_between_z),
-    "\n")
-
-print(names(gnocchi_logistic_test_between_z))
-```
-
-```{r}
-gnocchi_supp_table <- create_outlier_logistic_supp_table(
-  test_results = gnocchi_logistic_test_between_z,
-
-  source_df = ts_lf_merge %>%
-    as_tibble() %>%
-    filter(chromosome == "chr17"),
-
-  csv_file = "data/gnocchi_age_z_logistic.csv",
-
-  outcome_col = "gnocchi_z",
-
-  outcome_vec = c(
-    "<n4",
-    "n3-n4",
-    "n2-n3",
-    "n1-n2",
-    "0-n1",
-    "0-1",
-    "1-2",
-    "2-3",
-    "3-4",
-    ">=4"
-  ),
-
-  outlier_col = "time_z",
-  outlier_thresh_vec = c(-Inf, 0, 1, 2, 3, 4, Inf),
-
-  group_col = "AC_ts",
-  group_vals = 1:max_ac_count(ts_lf_merge, AF_thresh = 0.001),
-
-  direction = "between",
-
-  outlier_label = "Ultra-rare (DAF < 0.1%) mutation frequency-controlled age Z-score",
-  outcome_label = "Gnocchi constraint category"
-)
-```
-
-```{r}
-order_constraint <- c("<n4", "n3-n4", "n2-n3", "n1-n2", "0-n1", "0-1", "1-2", "2-3", "3-4", ">=4")
-gnocchi_z_plot <- gnocchi_logistic_test_between_z %>%
-enrichment_depletion_plot(
-  group_col = "gnocchi_z",
-  outlier_scores = unique(gnocchi_logistic_test_between_z$outlier_score),
-  group_vals = order_constraint
-) +
-scale_fill_viridis(option = "A", discrete = TRUE) +
-scale_color_viridis(option = "A", discrete = TRUE) +
-labs(
-  x = "Frequency-controlled age z-score bin",
-  y = "Relative P(class membership)"
-) +
-coord_cartesian(ylim = c(-0.4, 0.4)) +
-ggtitle("GEL DAF < 0.1%") +
-theme(
-    plot.title = element_text(size = rel(0.8)),  # Match axis text size
-    axis.text = element_text(size = rel(0.8))    # Adjust axis text size if needed
-  )
-```
-
-Constraint Z scores
-```{r}
-#### gnocchi constraint
-constraint_gnocchi <- fread(
-    file.path(paste0(paths$output,"all-chr17-gnocchi_constraint.tsv.gz"))
-  ) %>%
-  filter(
-    !(start > 18276569 & end < 26718757)
-  )
-```
-
-```{r}
-gnocchi_plot_constraint <- constraint_gnocchi %>%
-  mutate(
-    ymax = 1, ymin = -1,
-    gnocchi_z = factor(gnocchi_z, levels = order_constraint)
-  ) %>%
-  ggplot() +
-  theme_bw(base_size = 20) +
-  geom_rect(
-    aes(xmin = start/1e6, xmax = end/1e6,
-        ymin = ymin, ymax = ymax,
-        colour = gnocchi_z, fill = gnocchi_z),
-    alpha = 0.75
-  ) +
-  scale_y_continuous(expand = c(0,0)) +
-  scale_x_continuous(expand = c(0,0)) +
-  scale_fill_viridis(option = "A", discrete = TRUE) +
-  scale_color_viridis(option = "A", discrete = TRUE) +
-  labs(
-    x = "Position (Mb)\nChromosome 17",
-    fill   = "gnocchi constraint class (z-score bin)",
-    colour = "gnocchi constraint class (z-score bin)"
-  ) +
-  guides(
-    fill = guide_legend(
-      title.position = "top",
-      title.hjust    = 0.5,
-      nrow           = 1,
-      label = FALSE,
-      keywidth  = unit(25, "pt"),
-      keyheight = unit(25, "pt")
-    ),
-    colour = "none"
-  ) +
-  theme(
-    legend.position     = "top",
-    legend.box          = "horizontal",
-    legend.title.align  = 0.5,
-    legend.spacing.x     = unit(3, "pt"),
-    panel.grid          = element_blank(),
-    axis.text.y         = element_blank(),
-    axis.title.y        = element_blank(),
-    axis.ticks.y        = element_blank()
-  ) +
-  geom_vline(xintercept = c(18276569, 26718757)/1e6, linewidth = 0.5)
-```
-
-```{r, fig.width = 10, fig.height = 6}
-gnocchi_z_score_fig <- ggarrange(
-  ggarrange(NULL, gnocchi_plot_constraint, nrow = 1, widths = c(0.07, 1)),
-  NULL,
-  gnocchi_z_plot,
-  ncol = 1,
-  heights = c(0.65, 0.05, 1)
-)
-gnocchi_z_score_fig
-```
-
-Save to PDF for paper
-```{r}
-ggsave(paste0(paths$plots_dir, "tmp_gel_constraint_gnocchi_figure_toedit.pdf"), gnocchi_z_score_fig, width = 12, height = 9)
-```
-
 Missense restricted (smaller) tibble
 ```{r}
 ts_df_missense <- ts_lf_merge %>%
@@ -482,19 +269,28 @@ p_am_delta_by_ac <- ecdf_difference_by_ac_plot(
   group_vals = am_categories,
   reference_group = "Likely benign",
   log10 = TRUE,
+  count_size = 10,
   x_limits = c(1, 100000),
   colors = am_colors,
   min_n = 20
-) + 
-theme_bw() +
-theme(
-  axis.text.x = element_text(size = 6),
-  legend.position = "top",
-  strip.background = element_blank(),
-  panel.grid.minor = element_blank(),
-  panel.grid.major = element_blank()
-  ) + coord_cartesian(ylim = c(-0.05, 0.15)) +
+) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 11),
+    strip.text = element_text(size = 10),
+    strip.background = element_blank(),
+    legend.text = element_text(size = 10),
+    legend.title = element_text(size = 11),
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank()
+  ) +
+  coord_cartesian(
+    ylim = c(-0.05, 0.15)
+  ) +
   labs(
+    x = expression(log[10]~"allele age (generations)"),
     y = "Difference in ECDF\nvs Likely benign"
   )
 ```
@@ -559,19 +355,28 @@ p_pa_delta_by_ac <- ecdf_difference_by_ac_plot(
   group_vals = pa_categories,
   reference_group = "None",
   log10 = TRUE,
+  count_size = 10,
   x_limits = c(1, 100000),
   colors = pa_colors,
   min_n = 20
-) + 
-theme_bw() +
-theme(
-  axis.text.x = element_text(size = 6),
-  strip.background = element_blank(),
-  panel.grid.minor = element_blank(),
-  panel.grid.major = element_blank(),
-  legend.position = "top",
-  ) + coord_cartesian(ylim = c(-0.05, 0.15)) +
+) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 11),
+    strip.text = element_text(size = 10),
+    strip.background = element_blank(),
+    legend.text = element_text(size = 10),
+    legend.title = element_text(size = 11),
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank()
+  ) +
+  coord_cartesian(
+    ylim = c(-0.05, 0.15)
+  ) +
   labs(
+    x = expression(log[10]~"allele age (generations)"),
     y = "Difference in ECDF\nvs None"
   )
 ```
@@ -602,8 +407,11 @@ Combine the plots together for publication
 comb_plot <- cowplot::plot_grid(
   p_am_delta_by_ac,
   p_pa_delta_by_ac,
-  ncol = 1, labels = c("a", "b")
+  ncol = 1,
+  labels = c("a", "b"),
+  label_size = 12
 )
+
 comb_plot
 ```
 
@@ -1089,3 +897,227 @@ ggsave(paste0(paths$plots_dir, "primateai_3d_age_freq_plot.pdf"), pai3d_supp_plo
 ```
 
 Ill manually annotate with some stuff too.
+
+
+## Constraint Z-score plot
+gnomADv3.1 released Z-scores showing mutational constraint across chromosomes
+We can take a look at if there is any enrichment/depletion of allele frequency / allele age outliers (Z-scores) within constraint Z-score bins.
+
+Z-scoring just across chromosome 17
+```{r}
+ts_df_chr17 <- ts_lf_merge %>%
+filter(chromosome == "chr17") %>%
+dplyr::select(-time_z) %>%
+z_normalise(
+      group_col = "AC_ts",
+      score_col = "mean_time",
+      z_col = "time_z",
+      log10 = TRUE
+) %>% 
+as_tibble()
+```
+
+```{r}
+## takes a while, checkpoint
+checkpoint_gnocchi_regress <- paste0(
+  paths$output_dir,
+  "checkpoints/all-chr17-gnocchi_z-regression.tsv.gz"
+)
+
+cat("Gnocchi checkpoint:", checkpoint_gnocchi_regress, "\n")
+
+if (file.exists(checkpoint_gnocchi_regress)) {
+
+  cat("Loading existing Gnocchi regression checkpoint\n")
+
+  gnocchi_logistic_test_between_z <- data.table::fread(
+    checkpoint_gnocchi_regress
+  )
+
+} else {
+
+  cat("Checkpoint not found; running Gnocchi regressions\n")
+
+  gnocchi_logistic_test_between_z <-
+    outlier_logistic_loop_wrapper(
+      df = ts_df_chr17,
+      outcome_col = "gnocchi_z",
+      outcome_vec = c(
+        "<n4", "n3-n4", "n2-n3", "n1-n2",
+        "0-n1", "0-1", "1-2", "2-3", "3-4", ">=4"
+      ),
+      outlier_thresh_vec = c(-Inf, 0, 1, 2, 3, 4, Inf),
+      outlier_col = "time_z",
+      group_vals = 1:max_ac_count(
+        ts_lf_merge,
+        AF_thresh = 0.001
+      ),
+      group_col = "AC_ts",
+      direction = "between",
+      correct_groups = FALSE,
+      group_as_factor = FALSE
+    )
+
+  data.table::fwrite(
+    gnocchi_logistic_test_between_z,
+    checkpoint_gnocchi_regress,
+    sep = "\t"
+  )
+}
+
+gnocchi_logistic_test_between_z %<>%
+  mutate(
+    outlier_score = gsub(
+      " - ",
+      " to ",
+      outlier_score
+    ),
+    outlier_score = case_when(
+      outlier_score == "-Inf to 0" ~ "< 0",
+      outlier_score == "4 to Inf" ~ "> 4",
+      TRUE ~ outlier_score
+    )
+  )
+```
+
+```{r}
+cat("Gnocchi results dimensions:",
+    nrow(gnocchi_logistic_test_between_z),
+    "x",
+    ncol(gnocchi_logistic_test_between_z),
+    "\n")
+
+print(names(gnocchi_logistic_test_between_z))
+```
+
+```{r}
+gnocchi_supp_table <- create_outlier_logistic_supp_table(
+  test_results = gnocchi_logistic_test_between_z,
+
+  source_df = ts_df_chr17,
+
+  csv_file = "data/gnocchi_age_z_logistic.csv",
+
+  outcome_col = "gnocchi_z",
+
+  outcome_vec = c(
+    "<n4",
+    "n3-n4",
+    "n2-n3",
+    "n1-n2",
+    "0-n1",
+    "0-1",
+    "1-2",
+    "2-3",
+    "3-4",
+    ">=4"
+  ),
+
+  outlier_col = "time_z",
+  outlier_thresh_vec = c(-Inf, 0, 1, 2, 3, 4, Inf),
+
+  group_col = "AC_ts",
+  group_vals = 1:max_ac_count(ts_lf_merge, AF_thresh = 0.001),
+
+  direction = "between",
+
+  outlier_label = "Ultra-rare (DAF < 0.1%) mutation frequency-controlled age Z-score",
+  outcome_label = "Gnocchi constraint category"
+)
+```
+
+```{r}
+order_constraint <- c("<n4", "n3-n4", "n2-n3", "n1-n2", "0-n1", "0-1", "1-2", "2-3", "3-4", ">=4")
+gnocchi_z_plot <- gnocchi_logistic_test_between_z %>%
+enrichment_depletion_plot(
+  group_col = "gnocchi_z",
+  outlier_scores = unique(gnocchi_logistic_test_between_z$outlier_score),
+  group_vals = order_constraint
+) +
+scale_fill_viridis(option = "A", discrete = TRUE) +
+scale_color_viridis(option = "A", discrete = TRUE) +
+labs(
+  x = "Frequency-controlled age z-score bin",
+  y = "Relative P(class membership)"
+) +
+coord_cartesian(ylim = c(-0.5, 0.5)) +
+ggtitle("GEL DAF < 0.1%") +
+theme(
+    plot.title = element_text(size = rel(0.8)),  # Match axis text size
+    axis.text = element_text(size = rel(0.8))    # Adjust axis text size if needed
+  )
+```
+
+Constraint Z scores
+```{r}
+#### gnocchi constraint
+constraint_gnocchi <- fread(
+    file.path(paste0(paths$output,"all-chr17-gnocchi_constraint.tsv.gz"))
+  ) %>%
+  filter(
+    !(start > 18276569 & end < 26718757)
+  )
+```
+
+```{r}
+gnocchi_plot_constraint <- constraint_gnocchi %>%
+  mutate(
+    ymax = 1, ymin = -1,
+    gnocchi_z = factor(gnocchi_z, levels = order_constraint)
+  ) %>%
+  ggplot() +
+  theme_bw(base_size = 20) +
+  geom_rect(
+    aes(xmin = start/1e6, xmax = end/1e6,
+        ymin = ymin, ymax = ymax,
+        colour = gnocchi_z, fill = gnocchi_z),
+    alpha = 0.75
+  ) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "A", discrete = TRUE) +
+  scale_color_viridis(option = "A", discrete = TRUE) +
+  labs(
+    x = "Position (Mb)\nChromosome 17",
+    fill   = "gnocchi constraint class (z-score bin)",
+    colour = "gnocchi constraint class (z-score bin)"
+  ) +
+  guides(
+    fill = guide_legend(
+      title.position = "top",
+      title.hjust    = 0.5,
+      nrow           = 1,
+      label = FALSE,
+      keywidth  = unit(25, "pt"),
+      keyheight = unit(25, "pt")
+    ),
+    colour = "none"
+  ) +
+  theme(
+    legend.position     = "top",
+    legend.box          = "horizontal",
+    legend.title.align  = 0.5,
+    legend.spacing.x     = unit(3, "pt"),
+    panel.grid          = element_blank(),
+    axis.text.y         = element_blank(),
+    axis.title.y        = element_blank(),
+    axis.ticks.y        = element_blank()
+  ) +
+  geom_vline(xintercept = c(18276569, 26718757)/1e6, linewidth = 0.5)
+```
+
+```{r, fig.width = 10, fig.height = 6}
+gnocchi_z_score_fig <- ggarrange(
+  ggarrange(NULL, gnocchi_plot_constraint, nrow = 1, widths = c(0.07, 1)),
+  NULL,
+  gnocchi_z_plot,
+  ncol = 1,
+  heights = c(0.65, 0.05, 1)
+)
+gnocchi_z_score_fig
+```
+
+Save to PDF for paper
+```{r}
+ggsave(paste0(paths$plots_dir, "tmp_gel_constraint_gnocchi_figure_toedit.pdf"), gnocchi_z_score_fig, width = 12, height = 9)
+```
